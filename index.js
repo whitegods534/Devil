@@ -8,6 +8,7 @@ import {
 
 import axios from 'axios';
 import pg from 'pg';
+import http from 'http';
 
 const { Pool } = pg;
 
@@ -19,6 +20,9 @@ const FINANCIAL_OPERATIONS_ROLE = '1551601783581843497';
 const SUPPORT_ROLE = '1544700169277280368';
 
 const BADGE_ID = '1761374138287057';
+
+const PORT = process.env.PORT || 3000;
+const API_SECRET = process.env.API_SECRET;
 
 // ================================
 // DATABASE
@@ -86,7 +90,7 @@ async function setupDatabase() {
 }
 
 // ================================
-// ROBLOX LOOKUP
+// ROBLOX USER LOOKUP
 // ================================
 
 async function getRobloxUser(username) {
@@ -110,13 +114,127 @@ async function getRobloxUser(username) {
 }
 
 // ================================
-// BOT READY
+// ROBLOX AUTH API
+// ================================
+
+const server = http.createServer(async (req, res) => {
+
+    // Health check
+    if (req.method === 'GET' && req.url === '/') {
+        res.writeHead(200, {
+            'Content-Type': 'application/json'
+        });
+
+        return res.end(JSON.stringify({
+            status: 'online',
+            service: 'Devil Auth API'
+        }));
+    }
+
+    // Roblox authorization check
+    if (req.method === 'POST' && req.url === '/check') {
+
+        // Check secret
+        const authorization = req.headers.authorization;
+
+        if (
+            !API_SECRET ||
+            authorization !== `Bearer ${API_SECRET}`
+        ) {
+            res.writeHead(401, {
+                'Content-Type': 'application/json'
+            });
+
+            return res.end(JSON.stringify({
+                error: 'Unauthorized'
+            }));
+        }
+
+        let body = '';
+
+        req.on('data', chunk => {
+            body += chunk;
+        });
+
+        req.on('end', async () => {
+
+            try {
+                const data = JSON.parse(body);
+
+                const robloxUserId = data.robloxUserId;
+
+                if (!robloxUserId) {
+                    res.writeHead(400, {
+                        'Content-Type': 'application/json'
+                    });
+
+                    return res.end(JSON.stringify({
+                        error: 'Missing robloxUserId'
+                    }));
+                }
+
+                const result = await pool.query(
+                    `
+                    SELECT authorized
+                    FROM authorizations
+                    WHERE roblox_user_id = $1
+                    LIMIT 1
+                    `,
+                    [robloxUserId]
+                );
+
+                const authorized =
+                    result.rows.length > 0 &&
+                    result.rows[0].authorized === true;
+
+                res.writeHead(200, {
+                    'Content-Type': 'application/json'
+                });
+
+                return res.end(JSON.stringify({
+                    authorized: authorized
+                }));
+
+            } catch (error) {
+
+                console.error('Roblox API error:', error);
+
+                res.writeHead(500, {
+                    'Content-Type': 'application/json'
+                });
+
+                return res.end(JSON.stringify({
+                    error: 'Internal server error'
+                }));
+            }
+        });
+
+        return;
+    }
+
+    res.writeHead(404, {
+        'Content-Type': 'application/json'
+    });
+
+    res.end(JSON.stringify({
+        error: 'Not found'
+    }));
+});
+
+server.listen(PORT, () => {
+    console.log(`Devil Auth API running on port ${PORT}`);
+});
+
+// ================================
+// DISCORD BOT READY
 // ================================
 
 client.once('ready', async () => {
+
     console.log(`Logged in as ${client.user.tag}`);
 
     try {
+
         await setupDatabase();
 
         const rest = new REST({ version: '10' })
@@ -131,19 +249,24 @@ client.once('ready', async () => {
 
         console.log('Registered /auth and /check');
         console.log(`Badge ID: ${BADGE_ID}`);
+
     } catch (error) {
+
         console.error('Startup error:', error);
+
     }
 });
 
 // ================================
-// COMMAND HANDLER
+// DISCORD COMMAND HANDLER
 // ================================
 
 client.on('interactionCreate', async interaction => {
+
     if (!interaction.isChatInputCommand()) return;
 
-    const username = interaction.options.getString('robloxuser');
+    const username =
+        interaction.options.getString('robloxuser');
 
     // ============================
     // AUTH
@@ -165,9 +288,12 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply();
 
         try {
-            const robloxUser = await getRobloxUser(username);
+
+            const robloxUser =
+                await getRobloxUser(username);
 
             if (!robloxUser) {
+
                 return interaction.editReply(
                     `❌ Roblox user **${username}** could not be found.`
                 );
@@ -184,6 +310,7 @@ client.on('interactionCreate', async interaction => {
                     authorized_by
                 )
                 VALUES ($1, $2, $3, TRUE, NOW(), $4)
+
                 ON CONFLICT (roblox_user_id)
                 DO UPDATE SET
                     roblox_username = EXCLUDED.roblox_username,
@@ -207,6 +334,7 @@ client.on('interactionCreate', async interaction => {
             );
 
         } catch (error) {
+
             console.error('Auth error:', error);
 
             return interaction.editReply(
@@ -230,6 +358,7 @@ client.on('interactionCreate', async interaction => {
             );
 
         if (!allowed) {
+
             return interaction.reply({
                 content: 'You do not have permission to use this command.',
                 ephemeral: true
@@ -239,9 +368,12 @@ client.on('interactionCreate', async interaction => {
         await interaction.deferReply();
 
         try {
-            const robloxUser = await getRobloxUser(username);
+
+            const robloxUser =
+                await getRobloxUser(username);
 
             if (!robloxUser) {
+
                 return interaction.editReply(
                     `❌ Roblox user **${username}** could not be found.`
                 );
@@ -258,6 +390,7 @@ client.on('interactionCreate', async interaction => {
             );
 
             if (result.rows.length === 0) {
+
                 return interaction.editReply(
                     `❌ **${robloxUser.name}** is **not authorized**.`
                 );
@@ -266,6 +399,7 @@ client.on('interactionCreate', async interaction => {
             const user = result.rows[0];
 
             if (!user.authorized) {
+
                 return interaction.editReply(
                     `❌ **${robloxUser.name}** is **not authorized**.`
                 );
@@ -280,6 +414,7 @@ client.on('interactionCreate', async interaction => {
             );
 
         } catch (error) {
+
             console.error('Check error:', error);
 
             return interaction.editReply(
