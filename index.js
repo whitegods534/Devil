@@ -12,9 +12,9 @@ import http from 'http';
 
 const { Pool } = pg;
 
-// ================================
+// ==================================================
 // CONFIG
-// ================================
+// ==================================================
 
 const FINANCIAL_OPERATIONS_ROLE = '1551601783581843497';
 const SUPPORT_ROLE = '1544700169277280368';
@@ -24,9 +24,9 @@ const BADGE_ID = '1761374138287057';
 const PORT = process.env.PORT || 3000;
 const API_SECRET = process.env.API_SECRET;
 
-// ================================
+// ==================================================
 // DATABASE
-// ================================
+// ==================================================
 
 const pool = new Pool({
     connectionString: process.env.DATABASE_URL,
@@ -35,22 +35,23 @@ const pool = new Pool({
     }
 });
 
-// ================================
-// DISCORD CLIENT
-// ================================
+// ==================================================
+// DISCORD
+// ==================================================
 
 const client = new Client({
     intents: [GatewayIntentBits.Guilds]
 });
 
-// ================================
+// ==================================================
 // COMMANDS
-// ================================
+// ==================================================
 
 const commands = [
+
     new SlashCommandBuilder()
         .setName('auth')
-        .setDescription('Authorize a Roblox user')
+        .setDescription('Manually authorize a Roblox user')
         .addStringOption(option =>
             option
                 .setName('robloxuser')
@@ -67,13 +68,15 @@ const commands = [
                 .setDescription('Roblox username')
                 .setRequired(true)
         )
+
 ].map(command => command.toJSON());
 
-// ================================
+// ==================================================
 // DATABASE SETUP
-// ================================
+// ==================================================
 
 async function setupDatabase() {
+
     await pool.query(`
         CREATE TABLE IF NOT EXISTS authorizations (
             id SERIAL PRIMARY KEY,
@@ -81,19 +84,27 @@ async function setupDatabase() {
             roblox_user_id BIGINT UNIQUE NOT NULL,
             discord_user_id TEXT NOT NULL,
             authorized BOOLEAN NOT NULL DEFAULT TRUE,
+            authorization_source TEXT NOT NULL DEFAULT 'manual',
             authorized_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
             authorized_by TEXT NOT NULL
         )
     `);
 
+    // Add new columns if the old database already exists
+    await pool.query(`
+        ALTER TABLE authorizations
+        ADD COLUMN IF NOT EXISTS authorization_source TEXT NOT NULL DEFAULT 'manual'
+    `);
+
     console.log('Database ready');
 }
 
-// ================================
+// ==================================================
 // ROBLOX USER LOOKUP
-// ================================
+// ==================================================
 
 async function getRobloxUser(username) {
+
     const response = await axios.post(
         'https://users.roblox.com/v1/usernames/users',
         {
@@ -113,14 +124,18 @@ async function getRobloxUser(username) {
     return response.data.data[0];
 }
 
-// ================================
+// ==================================================
 // ROBLOX AUTH API
-// ================================
+// ==================================================
 
 const server = http.createServer(async (req, res) => {
 
-    // Health check
+    // ------------------------------------------------
+    // HEALTH CHECK
+    // ------------------------------------------------
+
     if (req.method === 'GET' && req.url === '/') {
+
         res.writeHead(200, {
             'Content-Type': 'application/json'
         });
@@ -131,16 +146,19 @@ const server = http.createServer(async (req, res) => {
         }));
     }
 
-    // Roblox authorization check
+    // ------------------------------------------------
+    // CHECK AUTHORIZATION
+    // ------------------------------------------------
+
     if (req.method === 'POST' && req.url === '/check') {
 
-        // Check secret
         const authorization = req.headers.authorization;
 
         if (
             !API_SECRET ||
             authorization !== `Bearer ${API_SECRET}`
         ) {
+
             res.writeHead(401, {
                 'Content-Type': 'application/json'
             });
@@ -159,11 +177,13 @@ const server = http.createServer(async (req, res) => {
         req.on('end', async () => {
 
             try {
+
                 const data = JSON.parse(body);
 
                 const robloxUserId = data.robloxUserId;
 
                 if (!robloxUserId) {
+
                     res.writeHead(400, {
                         'Content-Type': 'application/json'
                     });
@@ -192,12 +212,12 @@ const server = http.createServer(async (req, res) => {
                 });
 
                 return res.end(JSON.stringify({
-                    authorized: authorized
+                    authorized
                 }));
 
             } catch (error) {
 
-                console.error('Roblox API error:', error);
+                console.error('Check API error:', error);
 
                 res.writeHead(500, {
                     'Content-Type': 'application/json'
@@ -212,6 +232,131 @@ const server = http.createServer(async (req, res) => {
         return;
     }
 
+    // ------------------------------------------------
+    // BADGE AUTO-AUTHORIZATION
+    // ------------------------------------------------
+
+    if (
+        req.method === 'POST' &&
+        req.url === '/badge-authorize'
+    ) {
+
+        const authorization = req.headers.authorization;
+
+        if (
+            !API_SECRET ||
+            authorization !== `Bearer ${API_SECRET}`
+        ) {
+
+            res.writeHead(401, {
+                'Content-Type': 'application/json'
+            });
+
+            return res.end(JSON.stringify({
+                error: 'Unauthorized'
+            }));
+        }
+
+        let body = '';
+
+        req.on('data', chunk => {
+            body += chunk;
+        });
+
+        req.on('end', async () => {
+
+            try {
+
+                const data = JSON.parse(body);
+
+                const robloxUserId = data.robloxUserId;
+                const robloxUsername = data.robloxUsername;
+
+                if (!robloxUserId || !robloxUsername) {
+
+                    res.writeHead(400, {
+                        'Content-Type': 'application/json'
+                    });
+
+                    return res.end(JSON.stringify({
+                        error: 'Missing Roblox user information'
+                    }));
+                }
+
+                await pool.query(
+                    `
+                    INSERT INTO authorizations (
+                        roblox_username,
+                        roblox_user_id,
+                        discord_user_id,
+                        authorized,
+                        authorization_source,
+                        authorized_at,
+                        authorized_by
+                    )
+
+                    VALUES (
+                        $1,
+                        $2,
+                        'ROBLOX',
+                        TRUE,
+                        'badge',
+                        NOW(),
+                        'Roblox Badge System'
+                    )
+
+                    ON CONFLICT (roblox_user_id)
+                    DO UPDATE SET
+                        roblox_username = EXCLUDED.roblox_username,
+                        authorized = TRUE,
+                        authorization_source = 'badge',
+                        authorized_at = NOW(),
+                        authorized_by = 'Roblox Badge System'
+                    `,
+                    [
+                        robloxUsername,
+                        robloxUserId
+                    ]
+                );
+
+                console.log(
+                    `[BadgeAuth] Authorized ${robloxUsername} (${robloxUserId})`
+                );
+
+                res.writeHead(200, {
+                    'Content-Type': 'application/json'
+                });
+
+                return res.end(JSON.stringify({
+                    success: true,
+                    authorized: true,
+                    badgeId: BADGE_ID
+                }));
+
+            } catch (error) {
+
+                console.error(
+                    'Badge authorization error:',
+                    error
+                );
+
+                res.writeHead(500, {
+                    'Content-Type': 'application/json'
+                });
+
+                return res.end(JSON.stringify({
+                    error: 'Internal server error'
+                }));
+            }
+        });
+
+        return;
+    }
+
+    // ------------------------------------------------
+    // 404
+    // ------------------------------------------------
+
     res.writeHead(404, {
         'Content-Type': 'application/json'
     });
@@ -221,56 +366,82 @@ const server = http.createServer(async (req, res) => {
     }));
 });
 
+// ==================================================
+// START API
+// ==================================================
+
 server.listen(PORT, () => {
-    console.log(`Devil Auth API running on port ${PORT}`);
+
+    console.log(
+        `Devil Auth API running on port ${PORT}`
+    );
+
 });
 
-// ================================
-// DISCORD BOT READY
-// ================================
+// ==================================================
+// DISCORD READY
+// ==================================================
 
 client.once('ready', async () => {
 
-    console.log(`Logged in as ${client.user.tag}`);
+    console.log(
+        `Logged in as ${client.user.tag}`
+    );
 
     try {
 
         await setupDatabase();
 
-        const rest = new REST({ version: '10' })
-            .setToken(process.env.DISCORD_TOKEN);
+        const rest = new REST({
+            version: '10'
+        }).setToken(
+            process.env.DISCORD_TOKEN
+        );
 
         await rest.put(
-            Routes.applicationCommands(client.user.id),
+            Routes.applicationCommands(
+                client.user.id
+            ),
             {
                 body: commands
             }
         );
 
-        console.log('Registered /auth and /check');
-        console.log(`Badge ID: ${BADGE_ID}`);
+        console.log(
+            'Registered /auth and /check'
+        );
+
+        console.log(
+            `Badge ID: ${BADGE_ID}`
+        );
 
     } catch (error) {
 
-        console.error('Startup error:', error);
-
+        console.error(
+            'Startup error:',
+            error
+        );
     }
 });
 
-// ================================
-// DISCORD COMMAND HANDLER
-// ================================
+// ==================================================
+// DISCORD COMMANDS
+// ==================================================
 
 client.on('interactionCreate', async interaction => {
 
-    if (!interaction.isChatInputCommand()) return;
+    if (!interaction.isChatInputCommand()) {
+        return;
+    }
 
     const username =
-        interaction.options.getString('robloxuser');
+        interaction.options.getString(
+            'robloxuser'
+        );
 
-    // ============================
-    // AUTH
-    // ============================
+    // ==================================================
+    // /AUTH
+    // ==================================================
 
     if (interaction.commandName === 'auth') {
 
@@ -279,8 +450,10 @@ client.on('interactionCreate', async interaction => {
                 FINANCIAL_OPERATIONS_ROLE
             )
         ) {
+
             return interaction.reply({
-                content: 'You do not have permission to use this command.',
+                content:
+                    'You do not have permission to use this command.',
                 ephemeral: true
             });
         }
@@ -306,16 +479,27 @@ client.on('interactionCreate', async interaction => {
                     roblox_user_id,
                     discord_user_id,
                     authorized,
+                    authorization_source,
                     authorized_at,
                     authorized_by
                 )
-                VALUES ($1, $2, $3, TRUE, NOW(), $4)
+
+                VALUES (
+                    $1,
+                    $2,
+                    $3,
+                    TRUE,
+                    'manual',
+                    NOW(),
+                    $4
+                )
 
                 ON CONFLICT (roblox_user_id)
                 DO UPDATE SET
                     roblox_username = EXCLUDED.roblox_username,
                     discord_user_id = EXCLUDED.discord_user_id,
                     authorized = TRUE,
+                    authorization_source = 'manual',
                     authorized_at = NOW(),
                     authorized_by = EXCLUDED.authorized_by
                 `,
@@ -328,14 +512,18 @@ client.on('interactionCreate', async interaction => {
             );
 
             return interaction.editReply(
-                `✅ **${robloxUser.name}** has been authorized.\n\n` +
+                `✅ **${robloxUser.name}** has been manually authorized.\n\n` +
                 `Roblox ID: \`${robloxUser.id}\`\n` +
+                `Source: \`Manual\`\n` +
                 `Badge: \`${BADGE_ID}\``
             );
 
         } catch (error) {
 
-            console.error('Auth error:', error);
+            console.error(
+                'Auth error:',
+                error
+            );
 
             return interaction.editReply(
                 '❌ An error occurred while authorizing this user.'
@@ -343,9 +531,9 @@ client.on('interactionCreate', async interaction => {
         }
     }
 
-    // ============================
-    // CHECK
-    // ============================
+    // ==================================================
+    // /CHECK
+    // ==================================================
 
     if (interaction.commandName === 'check') {
 
@@ -360,7 +548,8 @@ client.on('interactionCreate', async interaction => {
         if (!allowed) {
 
             return interaction.reply({
-                content: 'You do not have permission to use this command.',
+                content:
+                    'You do not have permission to use this command.',
                 ephemeral: true
             });
         }
@@ -408,24 +597,33 @@ client.on('interactionCreate', async interaction => {
             return interaction.editReply(
                 `✅ **${robloxUser.name}** is **authorized**.\n\n` +
                 `Roblox ID: \`${robloxUser.id}\`\n` +
+                `Source: \`${user.authorization_source}\`\n` +
                 `Authorized: <t:${Math.floor(
-                    new Date(user.authorized_at).getTime() / 1000
+                    new Date(
+                        user.authorized_at
+                    ).getTime() / 1000
                 )}:F>`
             );
 
         } catch (error) {
 
-            console.error('Check error:', error);
+            console.error(
+                'Check error:',
+                error
+            );
 
             return interaction.editReply(
                 '❌ An error occurred while checking this user.'
             );
         }
     }
+
 });
 
-// ================================
+// ==================================================
 // LOGIN
-// ================================
+// ==================================================
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(
+    process.env.DISCORD_TOKEN
+);
