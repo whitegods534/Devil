@@ -151,9 +151,10 @@ const COLORS = {
 
 
 function getColor(name, fallback = "blue") {
-
-    return COLORS[name] || COLORS[fallback];
-
+    if (typeof name === "number") return name;
+    if (typeof name === "string" && /^\d+$/.test(name)) return Number(name);
+    if (typeof name === "string" && COLORS[name] !== undefined) return COLORS[name];
+    return COLORS[fallback] ?? COLORS.blue;
 }
 
 
@@ -4188,6 +4189,41 @@ commands.push(
                         ) 
                         .setRequired(true) 
                 ) 
+                .addStringOption(option => 
+                    option
+                        .setName("panel_color")
+                        .setDescription("Colour for the main ticket panel.")
+                        .setRequired(true)
+                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
+                )
+                .addStringOption(option => 
+                    option
+                        .setName("ticket_color")
+                        .setDescription("Colour for ticket embeds.")
+                        .setRequired(true)
+                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
+                )
+                .addStringOption(option => 
+                    option
+                        .setName("success_color")
+                        .setDescription("Colour for success messages.")
+                        .setRequired(true)
+                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
+                )
+                .addStringOption(option => 
+                    option
+                        .setName("error_color")
+                        .setDescription("Colour for error messages.")
+                        .setRequired(true)
+                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
+                )
+                .addStringOption(option => 
+                    option
+                        .setName("leaderboard_color")
+                        .setDescription("Colour for the leaderboard embed.")
+                        .setRequired(true)
+                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
+                )
         ) 
  
         .addSubcommand(sub => 
@@ -4307,7 +4343,7 @@ client.once("clientReady", async () => {
 function ticketPanelEmbed(config) { 
  
     return new EmbedBuilder() 
-        .setColor(getColor(config, "panel")) 
+        .setColor(getColor(config?.panel_color, "blue")) 
         .setTitle("🎫 DeadSignal Support") 
         .setDescription( 
             "Need help? Create a support ticket below.\n\n" + 
@@ -6499,7 +6535,7 @@ client.on("interactionCreate", async interaction => {
  
                     return interaction.reply({ 
                         content: 
-                            "❌ Financial Operations only.", 
+                            "❌ DeadSignal Operations only.", 
                         ephemeral: true 
                     }); 
                 } 
@@ -6527,7 +6563,13 @@ client.on("interactionCreate", async interaction => {
                 const panelChannel = 
                     interaction.options.getChannel( 
                         "panel_channel" 
-                    ); 
+                    );
+
+                const panelColor = interaction.options.getString("panel_color") || "blue";
+                const ticketColor = interaction.options.getString("ticket_color") || "blue";
+                const successColor = interaction.options.getString("success_color") || "green";
+                const errorColor = interaction.options.getString("error_color") || "red";
+                const leaderboardColor = interaction.options.getString("leaderboard_color") || "purple";
  
                 await saveTicketConfig( 
                     interaction.guild.id, 
@@ -6547,23 +6589,36 @@ client.on("interactionCreate", async interaction => {
                         panel_channel_id: 
                             panelChannel.id, 
  
-                        panel_color: 
-                            COLORS.blue, 
- 
-                        ticket_color: 
-                            COLORS.blue, 
- 
-                        success_color: 
-                            COLORS.green, 
- 
-                        error_color: 
-                            COLORS.red, 
- 
-                        leaderboard_color: 
-                            COLORS.purple 
+                        panel_color: panelColor,
+                        ticket_color: ticketColor,
+                        success_color: successColor,
+                        error_color: errorColor,
+                        leaderboard_color: leaderboardColor 
                     } 
                 ); 
  
+                let panelMessageId = null;
+                try {
+                    if (!panelChannel || !panelChannel.isTextBased()) {
+                        throw new Error("The selected panel channel is not a text channel.");
+                    }
+
+                    const savedConfig = await getTicketConfig(interaction.guild.id);
+                    const panelMessage = await panelChannel.send({
+                        embeds: [ticketPanelEmbed(savedConfig)],
+                        components: [ticketPanelButton()]
+                    });
+                    panelMessageId = panelMessage.id;
+
+                    await db(`
+                        UPDATE ticket_config
+                        SET panel_message_id = $1
+                        WHERE guild_id = $2
+                    `, [panelMessage.id, interaction.guild.id]);
+                } catch (panelError) {
+                    console.error("[TICKET SETUP PANEL ERROR]", panelError);
+                }
+
                 return interaction.reply({ 
                     embeds: [ 
                         successEmbed( 
@@ -6572,7 +6627,9 @@ client.on("interactionCreate", async interaction => {
                             `**Management:** <@&${managementRole.id}>\n` + 
                             `**Category:** ${category}\n` + 
                             `**Logs:** ${logChannel}\n` + 
-                            `**Panel:** ${panelChannel}` 
+                            `**Panel:** ${panelChannel}\n` +
+                            `**Colours:** ${panelColor}, ${ticketColor}, ${successColor}, ${errorColor}, ${leaderboardColor}\n` +
+                            (panelMessageId ? "\n✅ The panel was also sent automatically." : "\n⚠️ Configuration saved, but I could not send the panel. Check the bot's permissions in the panel channel.")
                         ) 
                     ], 
                     ephemeral: true 
@@ -6592,7 +6649,7 @@ client.on("interactionCreate", async interaction => {
  
                     return interaction.reply({ 
                         content: 
-                            "❌ Financial Operations only.", 
+                            "❌ DeadSignal Operations only.", 
                         ephemeral: true 
                     }); 
                 } 
@@ -7398,7 +7455,7 @@ client.on("interactionCreate", async interaction => {
  
                 return interaction.reply({ 
                     content: 
-                        "❌ Financial Operations only.", 
+                        "❌ DeadSignal Operations only.", 
                     ephemeral: true 
                 }); 
             } 
