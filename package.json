@@ -2,15 +2,13 @@
   "name": "devil-bot",
   "version": "1.0.0",
   "description": "Devil Discord Bot",
-  "type": "module",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.15.2",
-    "discord.js": "^14.26.4",
+    "discord.js": "^14.25.1",
     "express": "^5.1.0",
-    "pg": "^8.11.3"
+    "pg": "^8.16.3"
   }
 }
