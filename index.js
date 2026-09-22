@@ -648,52 +648,12 @@ async function updateLeaderboard(guild) {
    RAINBOW ROLE
 ========================================================= */
 
-let rainbowHue = 0;
-
-function hsvToRgb(h, s, v) {
-    h = h % 360;
-
-    const c = v * s;
-    const x = c * (1 - Math.abs((h / 60) % 2 - 1));
-    const m = v - c;
-
-    let r = 0;
-    let g = 0;
-    let b = 0;
-
-    if (h < 60) {
-        r = c;
-        g = x;
-    } else if (h < 120) {
-        r = x;
-        g = c;
-    } else if (h < 180) {
-        g = c;
-        b = x;
-    } else if (h < 240) {
-        g = x;
-        b = c;
-    } else if (h < 300) {
-        r = x;
-        b = c;
-    } else {
-        r = c;
-        b = x;
-    }
-
-    return {
-        r: Math.round((r + m) * 255),
-        g: Math.round((g + m) * 255),
-        b: Math.round((b + m) * 255)
-    };
-}
-
 function startRainbowRole() {
     console.log("[RAINBOW] Fast rainbow animation started.");
 
     setInterval(async () => {
         try {
-            rainbowHue += 10;
+            rainbowHue += 30;
 
             if (rainbowHue >= 360) {
                 rainbowHue = 0;
@@ -719,7 +679,7 @@ function startRainbowRole() {
         } catch (error) {
             console.error("[RAINBOW ERROR]", error.message);
         }
-    }, 1000);
+    }, 500);
 }
 
 /* =========================================================
