@@ -12,6 +12,9 @@ import {
     ActionRowBuilder,
     ButtonBuilder,
     ButtonStyle,
+    ModalBuilder,
+    TextInputBuilder,
+    TextInputStyle,
     SlashCommandBuilder
 } from "discord.js";
 
@@ -36,9 +39,8 @@ const FINANCIAL_OPERATIONS_ROLE_ID = "1551601783581843497";
 const LEADERBOARD_CHANNEL_ID = "1551976849385586759";
 const FEEDBACK_CHANNEL_ID = "1551996605719380128";
 
-/* =========================================================
-   CHECK ENVIRONMENT
-========================================================= */
+const pendingFeedback = new Map();
+const pendingClose = new Map();
 
 if (!TOKEN) {
     console.error("Missing DISCORD_TOKEN");
@@ -165,15 +167,20 @@ async function setupDatabase() {
     `);
 
     await query(`
-        CREATE TABLE IF NOT EXISTS ticket_feedback (
-            id SERIAL PRIMARY KEY,
-            guild_id TEXT NOT NULL,
+        CREATE TABLE IF NOT EXISTS ticket_join_requests (
             channel_id TEXT NOT NULL,
-            opener_id TEXT NOT NULL,
-            staff_id TEXT,
-            feedback TEXT NOT NULL,
-            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+            user_id TEXT NOT NULL,
+            user_tag TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            reason TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+            PRIMARY KEY (channel_id, user_id)
         )
+    `);
+
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS reason TEXT
     `);
 
     await query(`
@@ -206,13 +213,6 @@ const client = new Client({
 });
 
 /* =========================================================
-   FEEDBACK STATE
-========================================================= */
-
-const pendingFeedback = new Map();
-const pendingCloseChoice = new Map();
-
-/* =========================================================
    PERMISSION HELPERS
 ========================================================= */
 
@@ -223,15 +223,24 @@ function hasRole(member, roleId) {
 }
 
 function isSupport(member, config = null) {
+    return hasRole(
+        member,
+        config?.support_role_id || SUPPORT_ROLE_ID
+    );
+}
 
-    if (
-        config?.support_role_id &&
-        hasRole(member, config.support_role_id)
-    ) {
-        return true;
-    }
+async function getTicketConfig(guildId) {
 
-    return hasRole(member, SUPPORT_ROLE_ID);
+    const result = await query(
+        `
+        SELECT *
+        FROM ticket_config
+        WHERE guild_id = $1
+        `,
+        [guildId]
+    );
+
+    return result.rows[0] || null;
 }
 
 function isManagement(member, config) {
@@ -261,25 +270,7 @@ function canManageTickets(member, config) {
 }
 
 /* =========================================================
-   TICKET CONFIG
-========================================================= */
-
-async function getTicketConfig(guildId) {
-
-    const result = await query(
-        `
-        SELECT *
-        FROM ticket_config
-        WHERE guild_id = $1
-        `,
-        [guildId]
-    );
-
-    return result.rows[0] || null;
-}
-
-/* =========================================================
-   ROBLOX API HELPERS
+   ROBLOX HELPERS
 ========================================================= */
 
 async function getRobloxUser(username) {
@@ -294,11 +285,7 @@ async function getRobloxUser(username) {
             }
         );
 
-        if (
-            !response.data ||
-            !response.data.data ||
-            !response.data.data.length
-        ) {
+        if (!response.data?.data?.length) {
             return null;
         }
 
@@ -326,6 +313,7 @@ async function getRobloxProfile(userId) {
         return response.data;
 
     } catch {
+
         return null;
     }
 }
@@ -352,6 +340,7 @@ async function getRobloxAvatar(userId) {
         );
 
     } catch {
+
         return null;
     }
 }
@@ -369,8 +358,8 @@ async function getRobloxFollowers(userId) {
         );
 
         return {
-            followers: followers.data?.count || 0,
-            following: following.data?.count || 0
+            followers: followers.data?.count ?? 0,
+            following: following.data?.count ?? 0
         };
 
     } catch {
@@ -426,6 +415,7 @@ async function saveAuthorization({
         VALUES ($1,$2,$3,$4,$5,NOW(),$6)
 
         ON CONFLICT (roblox_user_id)
+
         DO UPDATE SET
             roblox_username = EXCLUDED.roblox_username,
             discord_user_id = EXCLUDED.discord_user_id,
@@ -460,10 +450,10 @@ async function saveAuthorization({
             robloxUsername,
             robloxUserId,
             authorized
-                ? "AUTHORIZED"
-                : "UNAUTHORIZED",
+                ? "authorized"
+                : "unauthorized",
             source,
-            discordUserId,
+            authorizedBy,
             authorizedBy
         ]
     );
@@ -486,7 +476,8 @@ function successEmbed(
     return new EmbedBuilder()
         .setTitle(`✅ ${title}`)
         .setDescription(description)
-        .setColor(getColor(color));
+        .setColor(getColor(color))
+        .setTimestamp();
 }
 
 function errorEmbed(
@@ -498,34 +489,35 @@ function errorEmbed(
     return new EmbedBuilder()
         .setTitle(`❌ ${title}`)
         .setDescription(description)
-        .setColor(getColor(color));
+        .setColor(getColor(color))
+        .setTimestamp();
 }
 
-/* =========================================================
-   TICKET EMBED
-========================================================= */
+function ticketEmbed(
+    config,
+    ticket,
+    opener
+) {
 
-function ticketEmbed(config, ticket) {
+    const color =
+        config?.ticket_color || "blue";
 
-    let status =
-        ticket.status?.toUpperCase() ||
-        "OPEN";
-
-    if (ticket.status === "escalated") {
-        status = "ESCALATED";
-    }
-
-    return new EmbedBuilder()
-        .setTitle("🎫 Devil Support Ticket")
+    const embed = new EmbedBuilder()
+        .setTitle("🎫 Support Ticket")
         .setDescription(
-            `Welcome <@${ticket.opener_id}>.\n\n` +
-            `Please explain your issue clearly. ` +
-            `A member of our support team will assist you.`
+            ticket.status === "claimed"
+                ? "This ticket has been claimed. Only the client and assigned staff can speak unless another staff member is approved through **Request to Join**."
+                : "A member of Support will assist you shortly."
         )
         .addFields(
             {
                 name: "Status",
-                value: `\`${status}\``,
+                value:
+                    ticket.status === "claimed"
+                        ? "🟢 Claimed"
+                        : ticket.status === "escalated"
+                            ? "🟠 Escalated"
+                            : "🟡 Open",
                 inline: true
             },
             {
@@ -541,15 +533,28 @@ function ticketEmbed(config, ticket) {
                 inline: true
             }
         )
-        .setColor(
-            getColor(
-                config?.ticket_color || "blue"
-            )
-        )
+        .setColor(getColor(color))
         .setFooter({
             text: "Devil Support"
         })
         .setTimestamp();
+
+    if (ticket.status === "escalated") {
+
+        embed.addFields({
+            name: "Escalated To",
+            value: `<@&${MANAGER_ROLE_ID}>`,
+            inline: true
+        });
+    }
+
+    if (opener?.displayAvatarURL) {
+        embed.setThumbnail(
+            opener.displayAvatarURL()
+        );
+    }
+
+    return embed;
 }
 
 /* =========================================================
@@ -565,30 +570,326 @@ function ticketButtons() {
                 .setCustomId("ticket_claim")
                 .setLabel("Claim")
                 .setEmoji("📌")
-                .setStyle(
-                    ButtonStyle.Primary
-                ),
+                .setStyle(ButtonStyle.Primary),
 
             new ButtonBuilder()
                 .setCustomId("ticket_escalate")
                 .setLabel("Escalate")
                 .setEmoji("⚠️")
-                .setStyle(
-                    ButtonStyle.Secondary
-                ),
+                .setStyle(ButtonStyle.Secondary),
 
             new ButtonBuilder()
                 .setCustomId("ticket_close")
                 .setLabel("Close")
                 .setEmoji("🔒")
-                .setStyle(
-                    ButtonStyle.Danger
-                )
+                .setStyle(ButtonStyle.Danger)
+        );
+}
+
+function ticketClaimedButtons() {
+
+    return new ActionRowBuilder()
+        .addComponents(
+
+            new ButtonBuilder()
+                .setCustomId("ticket_join_request")
+                .setLabel("Request to Join")
+                .setEmoji("👥")
+                .setStyle(ButtonStyle.Primary),
+
+            new ButtonBuilder()
+                .setCustomId("ticket_unclaim")
+                .setLabel("Unclaim")
+                .setEmoji("↩️")
+                .setStyle(ButtonStyle.Secondary),
+
+            new ButtonBuilder()
+                .setCustomId("ticket_escalate")
+                .setLabel("Escalate")
+                .setEmoji("⚠️")
+                .setStyle(ButtonStyle.Secondary),
+
+            new ButtonBuilder()
+                .setCustomId("ticket_close")
+                .setLabel("Close")
+                .setEmoji("🔒")
+                .setStyle(ButtonStyle.Danger)
         );
 }
 
 /* =========================================================
-   TICKET LOGGING
+   JOIN REQUEST MODAL
+========================================================= */
+
+function joinRequestModal() {
+
+    const modal = new ModalBuilder()
+        .setCustomId("ticket_join_reason")
+        .setTitle("Request to Join Ticket");
+
+    const reason = new TextInputBuilder()
+        .setCustomId("reason")
+        .setLabel("Why should you be accepted?")
+        .setStyle(TextInputStyle.Paragraph)
+        .setPlaceholder(
+            "Explain why you need to join this ticket..."
+        )
+        .setMinLength(5)
+        .setMaxLength(500)
+        .setRequired(true);
+
+    modal.addComponents(
+        new ActionRowBuilder()
+            .addComponents(reason)
+    );
+
+    return modal;
+}
+
+/* =========================================================
+   JOIN REQUEST APPROVE / DENY BUTTONS
+========================================================= */
+
+function joinRequestButtons(
+    userId,
+    joined = 0
+) {
+
+    return new ActionRowBuilder()
+        .addComponents(
+
+            new ButtonBuilder()
+                .setCustomId(
+                    `ticket_join_approve:${userId}`
+                )
+                .setLabel(
+                    `Accept (${joined}/1)`
+                )
+                .setEmoji("✅")
+                .setStyle(ButtonStyle.Success),
+
+            new ButtonBuilder()
+                .setCustomId(
+                    `ticket_join_deny:${userId}`
+                )
+                .setLabel("Deny")
+                .setEmoji("❌")
+                .setStyle(ButtonStyle.Danger)
+        );
+}
+
+/* =========================================================
+   FEEDBACK BUTTONS
+========================================================= */
+
+function closeChoiceButtons() {
+
+    return new ActionRowBuilder()
+        .addComponents(
+
+            new ButtonBuilder()
+                .setCustomId(
+                    "feedback_close_yes"
+                )
+                .setLabel("Yes, close it")
+                .setEmoji("🔒")
+                .setStyle(ButtonStyle.Success),
+
+            new ButtonBuilder()
+                .setCustomId(
+                    "feedback_close_no"
+                )
+                .setLabel("No, keep it open")
+                .setEmoji("↩️")
+                .setStyle(ButtonStyle.Secondary)
+        );
+}
+
+/* =========================================================
+   TICKET FEEDBACK
+========================================================= */
+
+async function requestTicketFeedback(
+    guild,
+    channel,
+    ticket
+) {
+
+    if (
+        !ticket?.opener_id ||
+        !ticket?.claimer_id
+    ) {
+
+        setTimeout(
+            async () => {
+                await channel.delete()
+                    .catch(() => {});
+            },
+            10 * 60 * 1000
+        );
+
+        return;
+    }
+
+    try {
+
+        const clientUser =
+            await client.users.fetch(
+                ticket.opener_id
+            );
+
+        const staffUser =
+            await client.users.fetch(
+                ticket.claimer_id
+            );
+
+        const dm =
+            await clientUser.createDM();
+
+        await dm.send({
+
+            embeds: [
+
+                new EmbedBuilder()
+                    .setTitle("🎫 Ticket Feedback")
+                    .setDescription(
+                        `Please could you give ${staffUser} feedback on how they handled this ticket?\n\n` +
+                        "Simply send your feedback as your next message.\n\n" +
+                        "You have 10 minutes to send your feedback."
+                    )
+                    .setColor(
+                        getColor("purple")
+                    )
+                    .setTimestamp()
+            ]
+        });
+
+        const timeout = setTimeout(
+            async () => {
+
+                const pending =
+                    pendingFeedback.get(
+                        clientUser.id
+                    );
+
+                if (
+                    !pending ||
+                    pending.channelId !==
+                        channel.id
+                ) {
+                    return;
+                }
+
+                pendingFeedback.delete(
+                    clientUser.id
+                );
+
+                await channel.delete()
+                    .catch(() => {});
+
+            },
+            10 * 60 * 1000
+        );
+
+        pendingFeedback.set(
+            clientUser.id,
+            {
+                channelId: channel.id,
+                guildId: guild.id,
+                staffId: staffUser.id,
+                staffTag: staffUser.tag,
+                timeout
+            }
+        );
+
+    } catch (error) {
+
+        console.error(
+            "[FEEDBACK REQUEST ERROR]",
+            error.message
+        );
+
+        setTimeout(
+            async () => {
+                await channel.delete()
+                    .catch(() => {});
+            },
+            10 * 60 * 1000
+        );
+    }
+}
+
+async function sendFeedbackToStaff(
+    message,
+    feedback
+) {
+
+    const feedbackChannel =
+        await client.channels.fetch(
+            FEEDBACK_CHANNEL_ID
+        ).catch(() => null);
+
+    const embed =
+        new EmbedBuilder()
+            .setTitle("⭐ New Ticket Feedback")
+            .setDescription(
+                `**Client:** ${message.author}\n` +
+                `**Staff Member:** <@${feedback.staffId}>\n\n` +
+                `**Feedback:**\n${message.content}`
+            )
+            .setColor(
+                getColor("green")
+            )
+            .setTimestamp();
+
+    if (feedbackChannel) {
+
+        await feedbackChannel.send({
+            content:
+                `<@${feedback.staffId}>`,
+            embeds: [embed]
+        }).catch(() => {});
+    }
+
+    const staffUser =
+        await client.users.fetch(
+            feedback.staffId
+        ).catch(() => null);
+
+    if (staffUser) {
+
+        await staffUser.send({
+            embeds: [embed]
+        }).catch(() => {});
+    }
+}
+
+async function finishTicketClose(
+    channel,
+    userId = null
+) {
+
+    if (userId) {
+
+        const pending =
+            pendingClose.get(userId);
+
+        if (pending?.timeout) {
+            clearTimeout(
+                pending.timeout
+            );
+        }
+
+        pendingClose.delete(userId);
+        pendingFeedback.delete(userId);
+    }
+
+    await channel.delete()
+        .catch(() => {});
+}
+
+/* =========================================================
+   LOGGING
 ========================================================= */
 
 async function logTicket(
@@ -612,11 +913,12 @@ async function logTicket(
         return;
     }
 
-    const embed = new EmbedBuilder()
-        .setTitle(title)
-        .setDescription(description)
-        .setColor(getColor(color))
-        .setTimestamp();
+    const embed =
+        new EmbedBuilder()
+            .setTitle(title)
+            .setDescription(description)
+            .setColor(getColor(color))
+            .setTimestamp();
 
     await channel.send({
         embeds: [embed]
@@ -624,7 +926,7 @@ async function logTicket(
 }
 
 /* =========================================================
-   CLAIM SYSTEM
+   CLAIM STATISTICS
 ========================================================= */
 
 async function addClaim(
@@ -644,11 +946,10 @@ async function addClaim(
         VALUES ($1,$2,$3,1)
 
         ON CONFLICT (guild_id,user_id)
+
         DO UPDATE SET
-            count =
-                ticket_claims.count + 1,
-            user_tag =
-                EXCLUDED.user_tag
+            count = ticket_claims.count + 1,
+            user_tag = EXCLUDED.user_tag
         `,
         [
             guildId,
@@ -683,7 +984,9 @@ async function wipeClaims(
 async function updateLeaderboard(guild) {
 
     const config =
-        await getTicketConfig(guild.id);
+        await getTicketConfig(
+            guild.id
+        );
 
     if (!config) {
         return;
@@ -698,52 +1001,56 @@ async function updateLeaderboard(guild) {
         return;
     }
 
-    const result = await query(
-        `
-        SELECT
-            user_id,
-            user_tag,
-            count
-        FROM ticket_claims
-        WHERE guild_id = $1
-        ORDER BY count DESC
-        LIMIT 10
-        `,
-        [guild.id]
-    );
+    const result =
+        await query(
+            `
+            SELECT user_id, user_tag, count
+            FROM ticket_claims
+            WHERE guild_id = $1
+            ORDER BY count DESC
+            LIMIT 10
+            `,
+            [guild.id]
+        );
 
-    let description =
-        "No ticket claims have been recorded yet.";
+    const rows = result.rows;
 
-    if (result.rows.length) {
+    let description = "";
+
+    if (!rows.length) {
 
         description =
-            result.rows
+            "No ticket claims have been recorded yet.";
+
+    } else {
+
+        description =
+            rows
                 .map((row, index) => {
 
                     const position =
                         index + 1;
 
-                    let prefix =
+                    let medal =
                         `${position}.`;
 
                     if (position === 1) {
-                        prefix = "🥇";
+                        medal = "🥇";
                     }
 
                     if (position === 2) {
-                        prefix = "🥈";
+                        medal = "🥈";
                     }
 
                     if (position === 3) {
-                        prefix = "🥉";
+                        medal = "🥉";
                     }
 
                     return (
-                        `${prefix} ` +
-                        `<@${row.user_id}> — ` +
+                        `${medal} <@${row.user_id}> — ` +
                         `**${row.count} claims**`
                     );
+
                 })
                 .join("\n");
     }
@@ -756,6 +1063,12 @@ async function updateLeaderboard(guild) {
             .setDescription(
                 description
             )
+            .addFields({
+                name: "Updates",
+                value:
+                    "Automatically updated every 30 minutes.",
+                inline: false
+            })
             .setColor(
                 getColor(
                     config.leaderboard_color ||
@@ -763,21 +1076,20 @@ async function updateLeaderboard(guild) {
                 )
             )
             .setFooter({
-                text:
-                    "Devil Support • Updates every 30 minutes"
+                text: "Devil Support"
             })
             .setTimestamp();
 
     let message = null;
 
-    if (config.leaderboard_message_id) {
+    if (
+        config.leaderboard_message_id
+    ) {
 
         message =
-            await channel.messages
-                .fetch(
-                    config.leaderboard_message_id
-                )
-                .catch(() => null);
+            await channel.messages.fetch(
+                config.leaderboard_message_id
+            ).catch(() => null);
     }
 
     if (message) {
@@ -786,838 +1098,1417 @@ async function updateLeaderboard(guild) {
             embeds: [embed]
         }).catch(() => {});
 
-    } else {
-
-        const newMessage =
-            await channel.send({
-                embeds: [embed]
-            });
-
-        await query(
-            `
-            UPDATE ticket_config
-            SET leaderboard_message_id = $1
-            WHERE guild_id = $2
-            `,
-            [
-                newMessage.id,
-                guild.id
-            ]
-        );
-    }
-}
-
-/* =========================================================
-   FEEDBACK FLOW
-========================================================= */
-
-async function finishTicketClose(
-    guildId,
-    channelId
-) {
-
-    const guild =
-        client.guilds.cache.get(guildId);
-
-    if (!guild) {
         return;
     }
 
-    const channel =
-        guild.channels.cache.get(channelId);
-
-    await query(
-        `
-        UPDATE tickets
-        SET status = 'closed',
-            closed_at = NOW()
-        WHERE channel_id = $1
-        `,
-        [channelId]
-    );
-
-    const config =
-        await getTicketConfig(guildId);
-
-    if (config) {
-
-        await logTicket(
-            guild,
-            config,
-            "Ticket Closed",
-            `<#${channelId}> has been closed.`,
-            "red"
-        );
-    }
-
-    if (channel) {
-
+    message =
         await channel.send({
-            embeds: [
-                successEmbed(
-                    "Ticket Closed",
-                    "This ticket is now being closed."
-                )
-            ]
-        }).catch(() => {});
+            embeds: [embed]
+        }).catch(() => null);
 
-        setTimeout(() => {
-
-            channel.delete()
-                .catch(() => {});
-
-        }, 5000);
-    }
-}
-
-async function beginFeedbackFlow(
-    interaction,
-    ticket,
-    config
-) {
-
-    const opener =
-        await client.users
-            .fetch(ticket.opener_id)
-            .catch(() => null);
-
-    if (!opener) {
-
-        await finishTicketClose(
-            interaction.guild.id,
-            interaction.channel.id
-        );
-
+    if (!message) {
         return;
     }
-
-    const previousStatus =
-        ticket.status === "feedback"
-            ? "open"
-            : ticket.status;
-
-    await query(
-        `
-        UPDATE tickets
-        SET status = 'feedback'
-        WHERE channel_id = $1
-        `,
-        [interaction.channel.id]
-    );
-
-    const feedbackEmbed =
-        new EmbedBuilder()
-            .setTitle(
-                "📝 Ticket Feedback"
-            )
-            .setDescription(
-                "Your ticket is being closed.\n\n" +
-                "Please reply to this DM with your feedback " +
-                "about the support you received.\n\n" +
-                "You have **10 minutes** to respond."
-            )
-            .setColor(
-                getColor(
-                    config.success_color ||
-                    "green"
-                )
-            )
-            .setFooter({
-                text: "Devil Support"
-            });
-
-    try {
-
-        await opener.send({
-            embeds: [feedbackEmbed]
-        });
-
-    } catch {
-
-        await finishTicketClose(
-            interaction.guild.id,
-            interaction.channel.id
-        );
-
-        return;
-    }
-
-    const timer =
-        setTimeout(async () => {
-
-            if (
-                pendingFeedback.has(
-                    opener.id
-                )
-            ) {
-
-                pendingFeedback.delete(
-                    opener.id
-                );
-
-                await finishTicketClose(
-                    interaction.guild.id,
-                    interaction.channel.id
-                );
-            }
-
-        }, 10 * 60 * 1000);
-
-    pendingFeedback.set(
-        opener.id,
-        {
-            guildId:
-                interaction.guild.id,
-
-            channelId:
-                interaction.channel.id,
-
-            staffId:
-                interaction.user.id,
-
-            previousStatus,
-
-            timer
-        }
-    );
-
-    await interaction.reply({
-        embeds: [
-            successEmbed(
-                "Feedback Requested",
-                "The ticket opener has been sent a feedback request. " +
-                "The ticket will remain here until they respond."
-            )
-        ],
-        ephemeral: true
-    });
-}
-
-/* =========================================================
-   FEEDBACK MESSAGE HANDLER
-========================================================= */
-
-client.on(
-    "messageCreate",
-    async message => {
-
-        if (message.author.bot) {
-            return;
-        }
-
-        if (
-            message.channel.type !==
-            ChannelType.DM
-        ) {
-            return;
-        }
-
-        const pending =
-            pendingFeedback.get(
-                message.author.id
-            );
-
-        if (!pending) {
-            return;
-        }
-
-        clearTimeout(
-            pending.timer
-        );
-
-        pendingFeedback.delete(
-            message.author.id
-        );
-
-        await query(
-            `
-            INSERT INTO ticket_feedback (
-                guild_id,
-                channel_id,
-                opener_id,
-                staff_id,
-                feedback
-            )
-            VALUES ($1,$2,$3,$4,$5)
-            `,
-            [
-                pending.guildId,
-                pending.channelId,
-                message.author.id,
-                pending.staffId,
-                message.content
-            ]
-        );
-
-        const guild =
-            client.guilds.cache.get(
-                pending.guildId
-            );
-
-        if (guild) {
-
-            const feedbackChannel =
-                guild.channels.cache.get(
-                    FEEDBACK_CHANNEL_ID
-                );
-
-            if (feedbackChannel) {
-
-                const embed =
-                    new EmbedBuilder()
-                        .setTitle(
-                            "⭐ New Ticket Feedback"
-                        )
-                        .addFields(
-                            {
-                                name:
-                                    "User",
-                                value:
-                                    `<@${message.author.id}>`,
-                                inline: true
-                            },
-                            {
-                                name:
-                                    "Staff",
-                                value:
-                                    pending.staffId
-                                        ? `<@${pending.staffId}>`
-                                        : "Unknown",
-                                inline: true
-                            },
-                            {
-                                name:
-                                    "Ticket",
-                                value:
-                                    `<#${pending.channelId}>`,
-                                inline: true
-                            },
-                            {
-                                name:
-                                    "Feedback",
-                                value:
-                                    message.content
-                                        .slice(
-                                            0,
-                                            1024
-                                        )
-                            }
-                        )
-                        .setColor(
-                            getColor("green")
-                        )
-                        .setTimestamp();
-
-                await feedbackChannel
-                    .send({
-                        embeds: [embed]
-                    })
-                    .catch(() => {});
-            }
-        }
-
-        const row =
-            new ActionRowBuilder()
-                .addComponents(
-
-                    new ButtonBuilder()
-                        .setCustomId(
-                            "feedback_close_yes"
-                        )
-                        .setLabel(
-                            "Delete Ticket"
-                        )
-                        .setEmoji("🗑️")
-                        .setStyle(
-                            ButtonStyle.Danger
-                        ),
-
-                    new ButtonBuilder()
-                        .setCustomId(
-                            "feedback_close_no"
-                        )
-                        .setLabel(
-                            "Keep Ticket Open"
-                        )
-                        .setEmoji("↩️")
-                        .setStyle(
-                            ButtonStyle.Secondary
-                        )
-                );
-
-        await message.author.send({
-            embeds: [
-                new EmbedBuilder()
-                    .setTitle(
-                        "Feedback Received"
-                    )
-                    .setDescription(
-                        "Thank you for your feedback.\n\n" +
-                        "Would you like the ticket to be deleted?"
-                    )
-                    .setColor(
-                        getColor("green")
-                    )
-            ],
-            components: [row]
-        }).catch(() => {});
-
-        const timer =
-            setTimeout(async () => {
-
-                if (
-                    pendingCloseChoice.has(
-                        message.author.id
-                    )
-                ) {
-
-                    pendingCloseChoice.delete(
-                        message.author.id
-                    );
-
-                    await finishTicketClose(
-                        pending.guildId,
-                        pending.channelId
-                    );
-                }
-
-            }, 10 * 60 * 1000);
-
-        pendingCloseChoice.set(
-            message.author.id,
-            {
-                guildId:
-                    pending.guildId,
-
-                channelId:
-                    pending.channelId,
-
-                previousStatus:
-                    pending.previousStatus,
-
-                timer
-            }
-        );
-    }
-);
-
-/* =========================================================
-   SLASH COMMANDS
-========================================================= */
-
-const commands = [
-
-    new SlashCommandBuilder()
-        .setName("auth")
-        .setDescription("Authorize a Roblox user")
-        .addStringOption(option =>
-            option
-                .setName("username")
-                .setDescription("Roblox username")
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName("check")
-        .setDescription("Check Roblox authorization")
-        .addStringOption(option =>
-            option
-                .setName("username")
-                .setDescription("Roblox username")
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName("profile")
-        .setDescription("View a Roblox profile")
-        .addStringOption(option =>
-            option
-                .setName("username")
-                .setDescription("Roblox username")
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName("history")
-        .setDescription("View authorization history")
-        .addStringOption(option =>
-            option
-                .setName("username")
-                .setDescription("Roblox username")
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName("escalate")
-        .setDescription("Escalate the current ticket"),
-
-    new SlashCommandBuilder()
-        .setName("stats")
-        .setDescription("View ticket statistics"),
-
-    new SlashCommandBuilder()
-        .setName("wipetickets")
-        .setDescription("Wipe a user's ticket claim statistics")
-        .addUserOption(option =>
-            option
-                .setName("user")
-                .setDescription("User to wipe")
-                .setRequired(true)
-        ),
-
-    new SlashCommandBuilder()
-        .setName("ticket")
-        .setDescription("Ticket management")
-
-        .addSubcommand(sub =>
-            sub
-                .setName("setup")
-                .setDescription("Setup the ticket system")
-
-                .addRoleOption(option =>
-                    option
-                        .setName("support_role")
-                        .setDescription("Support role")
-                        .setRequired(true)
-                )
-
-                .addRoleOption(option =>
-                    option
-                        .setName("management_role")
-                        .setDescription("Management role")
-                        .setRequired(true)
-                )
-
-                .addChannelOption(option =>
-                    option
-                        .setName("category")
-                        .setDescription("Ticket category")
-                        .addChannelTypes(
-                            ChannelType.GuildCategory
-                        )
-                        .setRequired(true)
-                )
-
-                .addChannelOption(option =>
-                    option
-                        .setName("log_channel")
-                        .setDescription("Ticket log channel")
-                        .addChannelTypes(
-                            ChannelType.GuildText
-                        )
-                        .setRequired(true)
-                )
-
-                .addStringOption(option =>
-                    option
-                        .setName("panel_color")
-                        .setDescription("Panel colour")
-                        .setRequired(true)
-                        .addChoices(
-                            ...Object.keys(COLORS).map(
-                                color => ({
-                                    name: color,
-                                    value: color
-                                })
-                            )
-                        )
-                )
-
-                .addStringOption(option =>
-                    option
-                        .setName("ticket_color")
-                        .setDescription("Ticket colour")
-                        .setRequired(true)
-                        .addChoices(
-                            ...Object.keys(COLORS).map(
-                                color => ({
-                                    name: color,
-                                    value: color
-                                })
-                            )
-                        )
-                )
-
-                .addStringOption(option =>
-                    option
-                        .setName("success_color")
-                        .setDescription("Success colour")
-                        .setRequired(true)
-                        .addChoices(
-                            ...Object.keys(COLORS).map(
-                                color => ({
-                                    name: color,
-                                    value: color
-                                })
-                            )
-                        )
-                )
-
-                .addStringOption(option =>
-                    option
-                        .setName("error_color")
-                        .setDescription("Error colour")
-                        .setRequired(true)
-                        .addChoices(
-                            ...Object.keys(COLORS).map(
-                                color => ({
-                                    name: color,
-                                    value: color
-                                })
-                            )
-                        )
-                )
-
-                .addStringOption(option =>
-                    option
-                        .setName("leaderboard_color")
-                        .setDescription("Leaderboard colour")
-                        .setRequired(true)
-                        .addChoices(
-                            ...Object.keys(COLORS).map(
-                                color => ({
-                                    name: color,
-                                    value: color
-                                })
-                            )
-                        )
-                )
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("panel")
-                .setDescription("Send the ticket panel")
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("claim")
-                .setDescription("Claim this ticket")
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("close")
-                .setDescription("Close this ticket")
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("unclaim")
-                .setDescription("Unclaim this ticket")
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("rename")
-                .setDescription("Rename this ticket")
-                .addStringOption(option =>
-                    option
-                        .setName("name")
-                        .setDescription("New ticket name")
-                        .setRequired(true)
-                )
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("add")
-                .setDescription("Add a user to this ticket")
-                .addUserOption(option =>
-                    option
-                        .setName("user")
-                        .setDescription("User")
-                        .setRequired(true)
-                )
-        )
-
-        .addSubcommand(sub =>
-            sub
-                .setName("remove")
-                .setDescription("Remove a user from this ticket")
-                .addUserOption(option =>
-                    option
-                        .setName("user")
-                        .setDescription("User")
-                        .setRequired(true)
-                )
-        )
-
-].map(command => command.toJSON());
-
-
-/* =========================================================
-   TICKET PANEL
-========================================================= */
-
-async function sendTicketPanel(
-    interaction,
-    config
-) {
-
-    const embed =
-        new EmbedBuilder()
-            .setTitle("🎫 Devil Support")
-            .setDescription(
-                "Need help?\n\n" +
-                "Click the button below to create a support ticket.\n\n" +
-                "Please provide as much information as possible " +
-                "when opening your ticket."
-            )
-            .addFields({
-                name: "Support",
-                value:
-                    `<@&${config.support_role_id}>`,
-                inline: true
-            })
-            .setColor(
-                getColor(
-                    config.panel_color ||
-                    "blue"
-                )
-            )
-            .setFooter({
-                text: "Devil Support System"
-            });
-
-    const buttons =
-        new ActionRowBuilder()
-            .addComponents(
-                new ButtonBuilder()
-                    .setCustomId(
-                        "ticket_create"
-                    )
-                    .setLabel(
-                        "Create Ticket"
-                    )
-                    .setEmoji("🎫")
-                    .setStyle(
-                        ButtonStyle.Primary
-                    )
-            );
-
-    const message =
-        await interaction.channel.send({
-            embeds: [embed],
-            components: [buttons]
-        });
 
     await query(
         `
         UPDATE ticket_config
-        SET
-            panel_channel_id = $1,
-            panel_message_id = $2
-        WHERE guild_id = $3
+        SET leaderboard_message_id = $1
+        WHERE guild_id = $2
         `,
         [
-            interaction.channel.id,
             message.id,
-            interaction.guild.id
+            guild.id
         ]
     );
-
-    return message;
 }
 
+/* =========================================================
+   LEADERBOARD TIMER
+========================================================= */
+
+setInterval(
+    async () => {
+
+        for (
+            const guild of
+            client.guilds.cache.values()
+        ) {
+
+            await updateLeaderboard(
+                guild
+            ).catch(() => {});
+        }
+
+    },
+    30 * 60 * 1000
+);
+
+/* =========================================================
+   READY
+========================================================= */
+
+client.once(
+    "clientReady",
+    async () => {
+
+        console.log(
+            `[DISCORD] Logged in as ${client.user.tag}`
+        );
+
+        try {
+
+            await setupDatabase();
+
+            for (
+                const guild of
+                client.guilds.cache.values()
+            ) {
+
+                await updateLeaderboard(
+                    guild
+                ).catch(() => {});
+            }
+
+        } catch (error) {
+
+            console.error(
+                "[READY ERROR]",
+                error
+            );
+        }
+    }
+);
+
+/* =========================================================
+   INTERACTIONS
+========================================================= */
+
+client.on(
+    "interactionCreate",
+    async interaction => {
+
+        try {
+
+            /* ============================================
+               JOIN REQUEST MODAL
+            ============================================ */
+
+            if (
+                interaction.isModalSubmit() &&
+                interaction.customId ===
+                    "ticket_join_reason"
+            ) {
+
+                const guild =
+                    interaction.guild;
+
+                if (!guild) {
+                    return;
+                }
+
+                const config =
+                    await getTicketConfig(
+                        guild.id
+                    );
+
+                if (!config) {
+
+                    return interaction.reply({
+                        content:
+                            "Ticket system is not configured.",
+                        ephemeral: true
+                    });
+                }
+
+                const ticketResult =
+                    await query(
+                        `
+                        SELECT *
+                        FROM tickets
+                        WHERE channel_id = $1
+                        `,
+                        [interaction.channel.id]
+                    );
+
+                const ticket =
+                    ticketResult.rows[0];
+
+                if (
+                    !ticket ||
+                    ticket.status === "closed"
+                ) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Not A Ticket",
+                                "This ticket is closed or no longer exists."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                if (!ticket.claimer_id) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Unclaimed",
+                                "This ticket is not currently claimed."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                if (
+                    !isSupport(
+                        interaction.member,
+                        config
+                    ) &&
+                    !isManagement(
+                        interaction.member,
+                        config
+                    )
+                ) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "No Permission",
+                                "Only Support or Management can request to join a claimed ticket."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                if (
+                    ticket.claimer_id ===
+                    interaction.user.id
+                ) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Already Joined",
+                                "You already have access to this ticket."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                const joinedResult =
+                    await query(
+                        `
+                        SELECT COUNT(*)::int AS count
+                        FROM ticket_join_requests
+                        WHERE channel_id = $1
+                        AND status = 'approved'
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                const joined =
+                    joinedResult.rows[0]?.count ||
+                    0;
+
+                if (joined >= 1) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Join Limit Reached",
+                                "This ticket already has 1 additional staff member joined (1/1)."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                const reason =
+                    interaction.fields
+                        .getTextInputValue(
+                            "reason"
+                        )
+                        .trim();
+
+                await query(
+                    `
+                    INSERT INTO ticket_join_requests (
+                        channel_id,
+                        user_id,
+                        user_tag,
+                        status,
+                        reason
+                    )
+                    VALUES (
+                        $1,
+                        $2,
+                        $3,
+                        'pending',
+                        $4
+                    )
+
+                    ON CONFLICT (
+                        channel_id,
+                        user_id
+                    )
+
+                    DO UPDATE SET
+                        status = 'pending',
+                        user_tag = EXCLUDED.user_tag,
+                        reason = EXCLUDED.reason,
+                        created_at = NOW()
+                    `,
+                    [
+                        interaction.channel.id,
+                        interaction.user.id,
+                        interaction.user.tag,
+                        reason
+                    ]
+                );
+
+                const requestEmbed =
+                    new EmbedBuilder()
+                        .setTitle(
+                            "👥 Request to Join"
+                        )
+                        .setDescription(
+                            `${interaction.user} would like to join the ticket.\n\n` +
+                            `**Reason:**\n${reason}\n\n` +
+                            `**Joined:** ${joined}/1 joined so far`
+                        )
+                        .setColor(
+                            getColor("purple")
+                        )
+                        .setTimestamp();
+
+                await interaction.reply({
+
+                    content:
+                        `<@${ticket.claimer_id}>`,
+
+                    embeds: [
+                        requestEmbed
+                    ],
+
+                    components: [
+                        joinRequestButtons(
+                            interaction.user.id,
+                            joined
+                        )
+                    ]
+                });
+
+                return;
+            }
+
+            /* ============================================
+               BUTTONS
+            ============================================ */
+
+            if (
+                interaction.isButton()
+            ) {
+
+                if (
+                    interaction.customId ===
+                    "ticket_create"
+                ) {
+                    return;
+                }
+
+                const guild =
+                    interaction.guild;
+
+                if (!guild) {
+                    return;
+                }
+
+                const config =
+                    await getTicketConfig(
+                        guild.id
+                    );
+
+                if (!config) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Not Configured",
+                                "The ticket system has not been configured."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                const ticketResult =
+                    await query(
+                        `
+                        SELECT *
+                        FROM tickets
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                const ticket =
+                    ticketResult.rows[0];
+
+                if (!ticket) {
+
+                    return interaction.reply({
+                        embeds: [
+                            errorEmbed(
+                                "Not A Ticket",
+                                "This channel is not a ticket."
+                            )
+                        ],
+                        ephemeral: true
+                    });
+                }
+
+                /* ========================================
+                   CLAIM
+                ======================================== */
+
+                if (
+                    interaction.customId ===
+                    "ticket_claim"
+                ) {
+
+                    if (
+                        !canManageTickets(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "You need Support or Management to claim tickets."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.status ===
+                        "closed"
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Closed",
+                                    "This ticket is already closed."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.claimer_id ===
+                        interaction.user.id
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Already Claimed",
+                                    "You already claimed this ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.claimer_id
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Already Claimed",
+                                    `This ticket is already claimed by <@${ticket.claimer_id}>.`
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            claimer_id = $1,
+                            claimed_at = NOW(),
+                            status = 'claimed'
+                        WHERE channel_id = $2
+                        `,
+                        [
+                            interaction.user.id,
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await addClaim(
+                        guild.id,
+                        interaction.user.id,
+                        interaction.user.tag
+                    );
+
+                    /*
+                       Every old join request is removed when
+                       a new staff member claims the ticket.
+                    */
+
+                    await query(
+                        `
+                        DELETE FROM ticket_join_requests
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                    /*
+                       Disable speaking for the general
+                       Support and Management roles.
+                    */
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.support_role_id,
+                            {
+                                SendMessages: false,
+                                AddReactions: false
+                            }
+                        )
+                        .catch(() => {});
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.management_role_id,
+                            {
+                                SendMessages: false,
+                                AddReactions: false
+                            }
+                        )
+                        .catch(() => {});
+
+                    /*
+                       The claimant can still speak.
+                    */
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            interaction.user.id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true,
+                                AttachFiles: true,
+                                EmbedLinks: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    /*
+                       Lock explicitly-added staff members
+                       so only the client and claimant can
+                       talk until a join request is approved.
+                    */
+
+                    for (
+                        const overwrite of
+                        interaction.channel
+                            .permissionOverwrites
+                            .cache
+                            .values()
+                    ) {
+
+                        if (
+                            overwrite.type !== 1
+                        ) {
+                            continue;
+                        }
+
+                        if (
+                            overwrite.id ===
+                                ticket.opener_id ||
+                            overwrite.id ===
+                                interaction.user.id
+                        ) {
+                            continue;
+                        }
+
+                        await interaction.channel
+                            .permissionOverwrites
+                            .edit(
+                                overwrite.id,
+                                {
+                                    SendMessages: false,
+                                    AddReactions: false
+                                }
+                            )
+                            .catch(() => {});
+                    }
+
+                    await interaction.reply({
+                        embeds: [
+                            successEmbed(
+                                "Ticket Claimed",
+                                `${interaction.user} has claimed this ticket.`,
+                                config.success_color
+                            )
+                        ]
+                    });
+
+                    await logTicket(
+                        guild,
+                        config,
+                        "Ticket Claimed",
+                        `${interaction.user} claimed ${interaction.channel}.`,
+                        config.success_color
+                    );
+
+                    await updateLeaderboard(
+                        guild
+                    );
+
+                    const claimedMessages =
+                        await interaction.channel
+                            .messages
+                            .fetch({
+                                limit: 10
+                            })
+                            .catch(() => null);
+
+                    if (claimedMessages) {
+
+                        const ticketMessage =
+                            claimedMessages.find(
+                                message =>
+                                    message.author.id ===
+                                        client.user.id &&
+                                    message.embeds?.[0]
+                                        ?.title ===
+                                        "🎫 Support Ticket"
+                            );
+
+                        if (ticketMessage) {
+
+                            const updatedTicket = {
+                                ...ticket,
+                                claimer_id:
+                                    interaction.user.id,
+                                status: "claimed"
+                            };
+
+                            await ticketMessage
+                                .edit({
+                                    embeds: [
+                                        ticketEmbed(
+                                            config,
+                                            updatedTicket,
+                                            interaction.guild
+                                                .members
+                                                .cache
+                                                .get(
+                                                    ticket.opener_id
+                                                )
+                                        )
+                                    ],
+                                    components: [
+                                        ticketClaimedButtons()
+                                    ]
+                                })
+                                .catch(() => {});
+                        }
+                    }
+
+                    return;
+                }
+
+                /* ========================================
+                   UNCLAIM
+                ======================================== */
+
+                if (
+                    interaction.customId ===
+                    "ticket_unclaim"
+                ) {
+
+                    if (
+                        !canManageTickets(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "You need Support or Management to unclaim tickets."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.claimer_id !==
+                            interaction.user.id &&
+                        !isManagement(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Not Your Ticket",
+                                    "Only the claimed staff member or Management can unclaim this ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            claimer_id = NULL,
+                            claimed_at = NULL,
+                            status = 'open'
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await query(
+                        `
+                        DELETE FROM ticket_join_requests
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.support_role_id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.management_role_id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    await interaction.reply({
+                        embeds: [
+                            successEmbed(
+                                "Ticket Unclaimed",
+                                `${interaction.user} unclaimed this ticket. Staff can now respond again.`,
+                                config.success_color
+                            )
+                        ]
+                    });
+
+                    const messages =
+                        await interaction.channel
+                            .messages
+                            .fetch({
+                                limit: 10
+                            })
+                            .catch(() => null);
+
+                    if (messages) {
+
+                        const ticketMessage =
+                            messages.find(
+                                message =>
+                                    message.author.id ===
+                                        client.user.id &&
+                                    message.embeds?.[0]
+                                        ?.title ===
+                                        "🎫 Support Ticket"
+                            );
+
+                        if (ticketMessage) {
+
+                            const updatedTicket = {
+                                ...ticket,
+                                claimer_id: null,
+                                status: "open"
+                            };
+
+                            await ticketMessage
+                                .edit({
+                                    embeds: [
+                                        ticketEmbed(
+                                            config,
+                                            updatedTicket,
+                                            interaction.guild
+                                                .members
+                                                .cache
+                                                .get(
+                                                    ticket.opener_id
+                                                )
+                                        )
+                                    ],
+                                    components: [
+                                        ticketButtons()
+                                    ]
+                                })
+                                .catch(() => {});
+                        }
+                    }
+
+                    return;
+                }
+
+                /* ========================================
+                   REQUEST TO JOIN BUTTON
+                ======================================== */
+
+                if (
+                    interaction.customId ===
+                    "ticket_join_request"
+                ) {
+
+                    if (
+                        !isSupport(
+                            interaction.member,
+                            config
+                        ) &&
+                        !isManagement(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "Only Support or Management can request to join a claimed ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (!ticket.claimer_id) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Unclaimed",
+                                    "This ticket is not currently claimed."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.claimer_id ===
+                        interaction.user.id
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Already Joined",
+                                    "You already have access to this ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    const joinedResult =
+                        await query(
+                            `
+                            SELECT COUNT(*)::int AS count
+                            FROM ticket_join_requests
+                            WHERE channel_id = $1
+                            AND status = 'approved'
+                            `,
+                            [
+                                interaction.channel.id
+                            ]
+                        );
+
+                    const joined =
+                        joinedResult.rows[0]?.count ||
+                        0;
+
+                    if (joined >= 1) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Join Limit Reached",
+                                    "This ticket already has 1 additional staff member joined (1/1)."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    const existing =
+                        await query(
+                            `
+                            SELECT status
+                            FROM ticket_join_requests
+                            WHERE channel_id = $1
+                            AND user_id = $2
+                            `,
+                            [
+                                interaction.channel.id,
+                                interaction.user.id
+                            ]
+                        );
+
+                    if (
+                        existing.rows[0]
+                            ?.status ===
+                        "approved"
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Already Joined",
+                                    "You already have access to this ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    /*
+                       Open the modal asking why they
+                       should be allowed into the ticket.
+                    */
+
+                    return interaction.showModal(
+                        joinRequestModal()
+                    );
+                }
+
+                /* ========================================
+                   ACCEPT / DENY JOIN REQUEST
+                ======================================== */
+
+                if (
+                    interaction.customId
+                        .startsWith(
+                            "ticket_join_approve:"
+                        ) ||
+                    interaction.customId
+                        .startsWith(
+                            "ticket_join_deny:"
+                        )
+                ) {
+
+                    /*
+                       ONLY the claimant or Management
+                       can accept or deny.
+                    */
+
+                    if (
+                        interaction.user.id !==
+                            ticket.claimer_id &&
+                        !isManagement(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "Only the claimed staff member or Management can handle join requests."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    const requestedUserId =
+                        interaction.customId
+                            .split(":")[1];
+
+                    const approve =
+                        interaction.customId
+                            .startsWith(
+                                "ticket_join_approve:"
+                            );
+
+                    const requestedUser =
+                        await client.users.fetch(
+                            requestedUserId
+                        ).catch(() => null);
+
+                    if (!requestedUser) {
+
+                        return interaction.reply({
+                            content:
+                                "User not found.",
+                            ephemeral: true
+                        });
+                    }
+
+                    if (approve) {
+
+                        const joinedResult =
+                            await query(
+                                `
+                                SELECT COUNT(*)::int AS count
+                                FROM ticket_join_requests
+                                WHERE channel_id = $1
+                                AND status = 'approved'
+                                `,
+                                [
+                                    interaction.channel.id
+                                ]
+                            );
+
+                        const joined =
+                            joinedResult.rows[0]
+                                ?.count || 0;
+
+                        if (joined >= 1) {
+
+                            return interaction.reply({
+                                embeds: [
+                                    errorEmbed(
+                                        "Join Limit Reached",
+                                        "This ticket already has 1 additional staff member joined (1/1)."
+                                    )
+                                ],
+                                ephemeral: true
+                            });
+                        }
+
+                        await interaction.channel
+                            .permissionOverwrites
+                            .edit(
+                                requestedUserId,
+                                {
+                                    ViewChannel: true,
+                                    SendMessages: true,
+                                    ReadMessageHistory: true,
+                                    AttachFiles: true,
+                                    EmbedLinks: true,
+                                    AddReactions: true
+                                }
+                            )
+                            .catch(() => {});
+
+                        await query(
+                            `
+                            UPDATE ticket_join_requests
+                            SET status = 'approved'
+                            WHERE channel_id = $1
+                            AND user_id = $2
+                            `,
+                            [
+                                interaction.channel.id,
+                                requestedUserId
+                            ]
+                        );
+
+                        const newCount =
+                            joined + 1;
+
+                        const approvedEmbed =
+                            interaction.message
+                                .embeds[0]
+                                ? EmbedBuilder.from(
+                                    interaction.message
+                                        .embeds[0]
+                                )
+                                : new EmbedBuilder();
+
+                        approvedEmbed
+                            .setColor(
+                                getColor("green")
+                            )
+                            .setFooter({
+                                text:
+                                    `${newCount}/1 joined so far`
+                            });
+
+                        await interaction.update({
+
+                            content:
+                                `✅ ${requestedUser} has been approved to join this ticket.\n\n` +
+                                `**${newCount}/1 joined so far**`,
+
+                            embeds: [
+                                approvedEmbed
+                            ],
+
+                            components: []
+                        });
+
+                    } else {
+
+                        await query(
+                            `
+                            UPDATE ticket_join_requests
+                            SET status = 'denied'
+                            WHERE channel_id = $1
+                            AND user_id = $2
+                            `,
+                            [
+                                interaction.channel.id,
+                                requestedUserId
+                            ]
+                        );
+
+                        const joinedResult =
+                            await query(
+                                `
+                                SELECT COUNT(*)::int AS count
+                                FROM ticket_join_requests
+                                WHERE channel_id = $1
+                                AND status = 'approved'
+                                `,
+                                [
+                                    interaction.channel.id
+                                ]
+                            );
+
+                        const joined =
+                            joinedResult.rows[0]
+                                ?.count || 0;
+
+                        const deniedEmbed =
+                            interaction.message
+                                .embeds[0]
+                                ? EmbedBuilder.from(
+                                    interaction.message
+                                        .embeds[0]
+                                )
+                                : new EmbedBuilder();
+
+                        deniedEmbed
+                            .setColor(
+                                getColor("red")
+                            )
+                            .setFooter({
+                                text:
+                                    `${joined}/1 joined so far`
+                            });
+
+                        await interaction.update({
+
+                            content:
+                                `❌ ${requestedUser}'s request to join was denied.\n\n` +
+                                `**${joined}/1 joined so far**`,
+
+                            embeds: [
+                                deniedEmbed
+                            ],
+
+                            components: []
+                        });
+                    }
+
+                    return;
+                }
+
+                /* ========================================
+                   ESCALATE
+                ======================================== */
+
+                if (
+                    interaction.customId ===
+                    "ticket_escalate"
+                ) {
+
+                    if (
+                        !canManageTickets(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "You need Support or Management to escalate tickets."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            status = 'escalated',
+                            escalated_by = $1,
+                            escalated_at = NOW()
+                        WHERE channel_id = $2
+                        `,
+                        [
+                            interaction.user.id,
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await interaction.reply({
+
+                        content:
+                            `<@&${MANAGER_ROLE_ID}>`,
+
+                        embeds: [
+
+                            new EmbedBuilder()
+                                .setTitle(
+                                    "⚠️ Ticket Escalated"
+                                )
+                                .setDescription(
+                                    `${interaction.user} has escalated this ticket to the Moderator team.`
+                                )
+                                .setColor(
+                                    getColor("orange")
+                                )
+                                .setTimestamp()
+                        ]
+                    });
+
+                    await logTicket(
+                        guild,
+                        config,
+                        "Ticket Escalated",
+                        `${interaction.user} escalated ${interaction.channel} to <@&${MANAGER_ROLE_ID}>.`,
+                        "orange"
+                    );
+
+                    return;
+                }
+
+                /* ========================================
+                   CLOSE
+                ======================================== */
+
+                if (
+                    interaction.customId ===
+                    "ticket_close"
+                ) {
+
+                    if (
+                        !canManageTickets(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "No Permission",
+                                    "You need Support or Management to close tickets."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            status = 'closed',
+                            closed_at = NOW()
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await interaction.reply({
+
+                        embeds: [
+
+                            successEmbed(
+                                "Ticket Closed",
+                                "The ticket has been closed. The client has been asked for feedback. If they do not respond within 10 minutes, the ticket will be deleted.",
+                                config.success_color
+                            )
+                        ]
+                    });
+
+                    await logTicket(
+                        guild,
+                        config,
+                        "Ticket Closed",
+                        `${interaction.user} closed ${interaction.channel}.`,
+                        config.success_color
+                    );
+
+                    await requestTicketFeedback(
+                        guild,
+                        interaction.channel,
+                        {
+                            ...ticket,
+                            claimer_id:
+                                ticket.claimer_id ||
+                                interaction.user.id
+                        }
+                    );
+
+                    return;
+                }
+            }
+
+            /* ============================================
+               END BUTTONS
+            ============================================ */
+
+        } catch (error) {
+
+            console.error(
+                "[INTERACTION ERROR]",
+                error
+            );
+
+            if (
+                interaction.replied ||
+                interaction.deferred
+            ) {
+
+                await interaction
+                    .followUp({
+                        embeds: [
+                            errorEmbed(
+                                "Error",
+                                "Something went wrong while processing that request."
+                            )
+                        ],
+                        ephemeral: true
+                    })
+                    .catch(() => {});
+
+            } else {
+
+                await interaction
+                    .reply({
+                        embeds: [
+                            errorEmbed(
+                                "Error",
+                                "Something went wrong while processing that request."
+                            )
+                        ],
+                        ephemeral: true
+                    })
+                    .catch(() => {});
+            }
+        }
+    }
+);
 
 /* =========================================================
    TICKET CREATION
 ========================================================= */
 
-async function createTicket(interaction) {
+async function createTicket(
+    interaction,
+    config
+) {
 
     const guild = interaction.guild;
 
-    if (!guild) {
-        return;
-    }
-
-    const config =
-        await getTicketConfig(guild.id);
-
-    if (!config) {
-
-        return interaction.reply({
-            embeds: [
-                errorEmbed(
-                    "Not Configured",
-                    "The ticket system has not been configured yet."
-                )
-            ],
-            ephemeral: true
-        });
-    }
-
-    const existing =
-        await query(
-            `
-            SELECT *
-            FROM tickets
-            WHERE guild_id = $1
-            AND opener_id = $2
-            AND status != 'closed'
-            LIMIT 1
-            `,
-            [
-                guild.id,
-                interaction.user.id
-            ]
-        );
+    const existing = await query(
+        `
+        SELECT *
+        FROM tickets
+        WHERE guild_id = $1
+        AND opener_id = $2
+        AND status != 'closed'
+        `,
+        [
+            guild.id,
+            interaction.user.id
+        ]
+    );
 
     if (existing.rows.length) {
 
-        const oldChannel =
+        const existingChannel =
             guild.channels.cache.get(
                 existing.rows[0].channel_id
             );
 
-        if (oldChannel) {
-
-            return interaction.reply({
-                embeds: [
-                    errorEmbed(
-                        "Ticket Already Open",
-                        `You already have a ticket: ${oldChannel}`
-                    )
-                ],
-                ephemeral: true
-            });
-        }
-
-        await query(
-            `
-            DELETE FROM tickets
-            WHERE channel_id = $1
-            `,
-            [
-                existing.rows[0].channel_id
-            ]
-        );
+        return {
+            success: false,
+            channel: existingChannel
+        };
     }
-
-    const safeName =
-        interaction.user.username
-            .toLowerCase()
-            .replace(
-                /[^a-z0-9-]/g,
-                "-"
-            )
-            .replace(
-                /-+/g,
-                "-"
-            )
-            .slice(0, 70);
 
     const channel =
         await guild.channels.create({
 
             name:
-                `ticket-${safeName}`,
+                `ticket-${interaction.user.username}`
+                    .toLowerCase()
+                    .replace(/[^a-z0-9-]/g, "")
+                    .slice(0, 80),
 
-            type:
-                ChannelType.GuildText,
+            type: ChannelType.GuildText,
 
             parent:
                 config.category_id,
@@ -1625,8 +2516,7 @@ async function createTicket(interaction) {
             permissionOverwrites: [
 
                 {
-                    id:
-                        guild.roles.everyone.id,
+                    id: guild.id,
 
                     deny: [
                         PermissionFlagsBits.ViewChannel
@@ -1634,59 +2524,45 @@ async function createTicket(interaction) {
                 },
 
                 {
-                    id:
-                        interaction.user.id,
+                    id: interaction.user.id,
 
                     allow: [
                         PermissionFlagsBits.ViewChannel,
                         PermissionFlagsBits.SendMessages,
-                        PermissionFlagsBits.ReadMessageHistory
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AddReactions,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
                     ]
                 },
 
                 {
-                    id:
-                        config.support_role_id,
+                    id: config.support_role_id,
 
                     allow: [
                         PermissionFlagsBits.ViewChannel,
                         PermissionFlagsBits.SendMessages,
-                        PermissionFlagsBits.ReadMessageHistory
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AddReactions,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
                     ]
                 },
 
                 {
-                    id:
-                        config.management_role_id,
+                    id: config.management_role_id,
 
                     allow: [
                         PermissionFlagsBits.ViewChannel,
                         PermissionFlagsBits.SendMessages,
-                        PermissionFlagsBits.ReadMessageHistory
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AddReactions,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
                     ]
                 }
             ]
         });
-
-    const ticket = {
-        channel_id:
-            channel.id,
-
-        guild_id:
-            guild.id,
-
-        opener_id:
-            interaction.user.id,
-
-        opener_tag:
-            interaction.user.tag,
-
-        claimer_id:
-            null,
-
-        status:
-            "open"
-    };
 
     await query(
         `
@@ -1707,16 +2583,33 @@ async function createTicket(interaction) {
         ]
     );
 
-    await channel.send({
-        content:
-            `<@${interaction.user.id}> <@&${config.support_role_id}>`,
+    const ticket = {
+        channel_id: channel.id,
+        guild_id: guild.id,
+        opener_id: interaction.user.id,
+        opener_tag: interaction.user.tag,
+        claimer_id: null,
+        status: "open"
+    };
 
-        embeds: [
-            ticketEmbed(
-                config,
-                ticket
-            )
-        ],
+    const opener =
+        guild.members.cache.get(
+            interaction.user.id
+        );
+
+    const embed =
+        ticketEmbed(
+            config,
+            ticket,
+            opener
+        );
+
+    await channel.send({
+
+        content:
+            `${interaction.user} <@&${config.support_role_id}>`,
+
+        embeds: [embed],
 
         components: [
             ticketButtons()
@@ -1727,20 +2620,76 @@ async function createTicket(interaction) {
         guild,
         config,
         "Ticket Created",
-        `${channel} was opened by ${interaction.user}.`,
-        "green"
+        `${interaction.user} created ${channel}.`,
+        config.ticket_color
     );
 
-    await interaction.reply({
-        embeds: [
-            successEmbed(
-                "Ticket Created",
-                `Your ticket has been created: ${channel}`,
-                config.success_color
+    return {
+        success: true,
+        channel
+    };
+}
+
+
+/* =========================================================
+   TICKET PANEL
+========================================================= */
+
+function ticketPanel(config) {
+
+    const embed =
+        new EmbedBuilder()
+            .setTitle("🎫 Devil Support")
+            .setDescription(
+                "Need help? Open a support ticket using the button below.\n\n" +
+                "Please provide as much information as possible so staff can assist you."
             )
-        ],
-        ephemeral: true
-    });
+            .addFields(
+                {
+                    name: "📌 Support",
+                    value:
+                        "Our support team will review your request.",
+                    inline: false
+                },
+                {
+                    name: "⚠️ Please Note",
+                    value:
+                        "Do not open multiple tickets for the same issue.",
+                    inline: false
+                }
+            )
+            .setColor(
+                getColor(
+                    config.panel_color ||
+                    "blue"
+                )
+            )
+            .setFooter({
+                text: "Devil Support"
+            })
+            .setTimestamp();
+
+    const row =
+        new ActionRowBuilder()
+            .addComponents(
+
+                new ButtonBuilder()
+                    .setCustomId(
+                        "ticket_create"
+                    )
+                    .setLabel(
+                        "Create Ticket"
+                    )
+                    .setEmoji("🎫")
+                    .setStyle(
+                        ButtonStyle.Primary
+                    )
+            );
+
+    return {
+        embeds: [embed],
+        components: [row]
+    };
 }
 
 
@@ -1767,463 +2716,8 @@ async function getCurrentTicket(
 
 
 /* =========================================================
-   BUTTON INTERACTIONS
-========================================================= */
-
-client.on(
-    "interactionCreate",
-    async interaction => {
-
-        if (!interaction.isButton()) {
-            return;
-        }
-
-        /* ================================================
-           FEEDBACK DELETE
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "feedback_close_yes"
-        ) {
-
-            const pending =
-                pendingCloseChoice.get(
-                    interaction.user.id
-                );
-
-            if (!pending) {
-
-                return interaction.reply({
-                    content:
-                        "This feedback request has expired.",
-                    ephemeral: true
-                });
-            }
-
-            clearTimeout(
-                pending.timer
-            );
-
-            pendingCloseChoice.delete(
-                interaction.user.id
-            );
-
-            await interaction.reply({
-                embeds: [
-                    successEmbed(
-                        "Ticket Deleting",
-                        "The ticket will now be deleted."
-                    )
-                ]
-            });
-
-            await finishTicketClose(
-                pending.guildId,
-                pending.channelId
-            );
-
-            return;
-        }
-
-
-        /* ================================================
-           FEEDBACK KEEP OPEN
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "feedback_close_no"
-        ) {
-
-            const pending =
-                pendingCloseChoice.get(
-                    interaction.user.id
-                );
-
-            if (!pending) {
-
-                return interaction.reply({
-                    content:
-                        "This feedback request has expired.",
-                    ephemeral: true
-                });
-            }
-
-            clearTimeout(
-                pending.timer
-            );
-
-            pendingCloseChoice.delete(
-                interaction.user.id
-            );
-
-            await query(
-                `
-                UPDATE tickets
-                SET status = $1
-                WHERE channel_id = $2
-                `,
-                [
-                    pending.previousStatus ||
-                        "open",
-
-                    pending.channelId
-                ]
-            );
-
-            await interaction.reply({
-                embeds: [
-                    successEmbed(
-                        "Ticket Kept Open",
-                        "The ticket will remain open."
-                    )
-                ]
-            });
-
-            const guild =
-                client.guilds.cache.get(
-                    pending.guildId
-                );
-
-            if (guild) {
-
-                const channel =
-                    guild.channels.cache.get(
-                        pending.channelId
-                    );
-
-                if (channel) {
-
-                    await channel.send({
-                        embeds: [
-                            successEmbed(
-                                "Ticket Reopened",
-                                `${interaction.user} chose to keep this ticket open.`
-                            )
-                        ]
-                    }).catch(() => {});
-                }
-            }
-
-            return;
-        }
-
-
-        /* ================================================
-           TICKET CREATE
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "ticket_create"
-        ) {
-
-            await createTicket(
-                interaction
-            );
-
-            return;
-        }
-
-
-        /* ================================================
-           NORMAL TICKET BUTTONS
-        ================================================ */
-
-        const guild =
-            interaction.guild;
-
-        if (!guild) {
-            return;
-        }
-
-        const config =
-            await getTicketConfig(
-                guild.id
-            );
-
-        if (!config) {
-
-            return interaction.reply({
-                embeds: [
-                    errorEmbed(
-                        "Not Configured",
-                        "The ticket system is not configured."
-                    )
-                ],
-                ephemeral: true
-            });
-        }
-
-        const ticket =
-            await getCurrentTicket(
-                interaction.channel.id
-            );
-
-        if (!ticket) {
-
-            return interaction.reply({
-                embeds: [
-                    errorEmbed(
-                        "Not A Ticket",
-                        "This channel is not a registered ticket."
-                    )
-                ],
-                ephemeral: true
-            });
-        }
-
-
-        /* ================================================
-           CLAIM
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "ticket_claim"
-        ) {
-
-            if (
-                !canManageTickets(
-                    interaction.member,
-                    config
-                )
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "No Permission",
-                            "You need Support or Management to claim tickets."
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            if (
-                ticket.status ===
-                "closed"
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "Closed",
-                            "This ticket is already closed."
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            if (
-                ticket.claimer_id &&
-                ticket.claimer_id !==
-                    interaction.user.id
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "Already Claimed",
-                            `This ticket is already claimed by <@${ticket.claimer_id}>.`
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            if (
-                ticket.claimer_id ===
-                interaction.user.id
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "Already Claimed",
-                            "You already claimed this ticket."
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            await query(
-                `
-                UPDATE tickets
-                SET
-                    claimer_id = $1,
-                    claimed_at = NOW(),
-                    status = 'claimed'
-                WHERE channel_id = $2
-                `,
-                [
-                    interaction.user.id,
-                    interaction.channel.id
-                ]
-            );
-
-            await addClaim(
-                guild.id,
-                interaction.user.id,
-                interaction.user.tag
-            );
-
-            await interaction.channel.permissionOverwrites
-                .edit(
-                    interaction.user.id,
-                    {
-                        ViewChannel: true,
-                        SendMessages: true,
-                        ReadMessageHistory: true
-                    }
-                )
-                .catch(() => {});
-
-            await interaction.reply({
-                embeds: [
-                    successEmbed(
-                        "Ticket Claimed",
-                        `${interaction.user} has claimed this ticket.`,
-                        config.success_color
-                    )
-                ]
-            });
-
-            await logTicket(
-                guild,
-                config,
-                "Ticket Claimed",
-                `${interaction.user} claimed ${interaction.channel}.`,
-                "blue"
-            );
-
-            await updateLeaderboard(
-                guild
-            );
-
-            return;
-        }
-
-
-        /* ================================================
-           ESCALATE
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "ticket_escalate"
-        ) {
-
-            if (
-                !canManageTickets(
-                    interaction.member,
-                    config
-                )
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "No Permission",
-                            "You need Support or Management to escalate tickets."
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            await query(
-                `
-                UPDATE tickets
-                SET
-                    status = 'escalated',
-                    escalated_by = $1,
-                    escalated_at = NOW()
-                WHERE channel_id = $2
-                `,
-                [
-                    interaction.user.id,
-                    interaction.channel.id
-                ]
-            );
-
-            await interaction.reply({
-                content:
-                    `<@&${MANAGER_ROLE_ID}>`,
-                embeds: [
-                    new EmbedBuilder()
-                        .setTitle(
-                            "⚠️ Ticket Escalated"
-                        )
-                        .setDescription(
-                            `${interaction.user} has escalated this ticket to the Moderator/Manager team.`
-                        )
-                        .setColor(
-                            getColor(
-                                "orange"
-                            )
-                        )
-                        .setTimestamp()
-                ]
-            });
-
-            await logTicket(
-                guild,
-                config,
-                "Ticket Escalated",
-                `${interaction.user} escalated ${interaction.channel}.`,
-                "orange"
-            );
-
-            return;
-        }
-
-
-        /* ================================================
-           CLOSE
-        ================================================ */
-
-        if (
-            interaction.customId ===
-            "ticket_close"
-        ) {
-
-            if (
-                !canManageTickets(
-                    interaction.member,
-                    config
-                )
-            ) {
-
-                return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "No Permission",
-                            "You need Support or Management to close tickets."
-                        )
-                    ],
-                    ephemeral: true
-                });
-            }
-
-            await beginFeedbackFlow(
-                interaction,
-                ticket,
-                config
-            );
-
-            return;
-        }
-    }
-);
-
-
-/* =========================================================
-   SLASH COMMAND HANDLER
+   SECOND INTERACTION HANDLER
+   SLASH COMMANDS
 ========================================================= */
 
 client.on(
@@ -2244,20 +2738,20 @@ client.on(
             if (!guild) {
 
                 return interaction.reply({
-                    embeds: [
-                        errorEmbed(
-                            "Server Only",
-                            "This command can only be used inside a server."
-                        )
-                    ],
+                    content:
+                        "This command can only be used inside a server.",
                     ephemeral: true
                 });
             }
 
+            const config =
+                await getTicketConfig(
+                    guild.id
+                );
 
-            /* ============================================
-               AUTH
-            ============================================ */
+            /* ==========================================
+               /AUTH
+            ========================================== */
 
             if (
                 interaction.commandName ===
@@ -2265,6 +2759,10 @@ client.on(
             ) {
 
                 if (
+                    !canManageTickets(
+                        interaction.member,
+                        config
+                    ) &&
                     !isFinancialOperations(
                         interaction.member
                     )
@@ -2274,7 +2772,7 @@ client.on(
                         embeds: [
                             errorEmbed(
                                 "No Permission",
-                                "You need Financial Operations to authorize users."
+                                "You do not have permission to authorize users."
                             )
                         ],
                         ephemeral: true
@@ -2284,35 +2782,36 @@ client.on(
                 const username =
                     interaction.options
                         .getString(
-                            "username",
+                            "robloxuser",
                             true
                         );
 
-                const roblox =
+                await interaction.deferReply();
+
+                const user =
                     await getRobloxUser(
                         username
                     );
 
-                if (!roblox) {
+                if (!user) {
 
-                    return interaction.reply({
+                    return interaction.editReply({
                         embeds: [
                             errorEmbed(
                                 "User Not Found",
-                                `I couldn't find the Roblox user \`${username}\`.`
+                                `I couldn't find the Roblox user **${username}**.`
                             )
-                        ],
-                        ephemeral: true
+                        ]
                     });
                 }
 
                 const result =
                     await saveAuthorization({
                         robloxUsername:
-                            roblox.name,
+                            user.name,
 
                         robloxUserId:
-                            roblox.id,
+                            user.id,
 
                         discordUserId:
                             interaction.user.id,
@@ -2321,68 +2820,92 @@ client.on(
                             "discord",
 
                         authorizedBy:
-                            interaction.user.tag
+                            interaction.user.id
                     });
 
                 if (
-                    !result.success &&
                     result.reason ===
-                        "rban"
+                    "rban"
                 ) {
 
-                    return interaction.reply({
+                    return interaction.editReply({
                         embeds: [
                             errorEmbed(
                                 "Authorization Blocked",
-                                "This Roblox account is rBanned and cannot be authorized."
+                                "This Roblox account is currently rBanned."
                             )
-                        ],
-                        ephemeral: true
+                        ]
                     });
                 }
 
-                return interaction.reply({
+                return interaction.editReply({
                     embeds: [
                         successEmbed(
                             "User Authorized",
-                            `**${roblox.name}** has been authorized successfully.`
+                            `**${user.name}** has been authorized.\n\nRoblox ID: \`${user.id}\``,
+                            config?.success_color ||
+                            "green"
                         )
                     ]
                 });
             }
 
 
-            /* ============================================
-               CHECK
-            ============================================ */
+            /* ==========================================
+               /CHECK
+            ========================================== */
 
             if (
                 interaction.commandName ===
                 "check"
             ) {
 
-                const username =
-                    interaction.options
-                        .getString(
-                            "username",
-                            true
-                        );
-
-                const roblox =
-                    await getRobloxUser(
-                        username
-                    );
-
-                if (!roblox) {
+                if (
+                    !canManageTickets(
+                        interaction.member,
+                        config
+                    ) &&
+                    !isFinancialOperations(
+                        interaction.member
+                    )
+                ) {
 
                     return interaction.reply({
                         embeds: [
                             errorEmbed(
-                                "User Not Found",
-                                `I couldn't find \`${username}\` on Roblox.`
+                                "No Permission",
+                                "You do not have permission to check authorizations."
                             )
                         ],
                         ephemeral: true
+                    });
+                }
+
+                const username =
+                    interaction.options
+                        .getString(
+                            "robloxuser",
+                            true
+                        );
+
+                await interaction.deferReply({
+                    ephemeral: true
+                });
+
+                const user =
+                    await getRobloxUser(
+                        username
+                    );
+
+                if (!user) {
+
+                    return interaction.editReply({
+                        embeds: [
+                            errorEmbed(
+                                "User Not Found",
+                                `Roblox user **${username}** was not found.`
+                            )
+                        ]
                     });
                 }
 
@@ -2393,50 +2916,93 @@ client.on(
                         FROM authorizations
                         WHERE roblox_user_id = $1
                         `,
-                        [roblox.id]
+                        [user.id]
                     );
 
-                const row =
+                const record =
                     result.rows[0];
 
-                if (!row) {
+                if (!record) {
 
-                    return interaction.reply({
+                    return interaction.editReply({
                         embeds: [
-                            errorEmbed(
-                                "Not Authorized",
-                                `**${roblox.name}** is not currently authorized.`
-                            )
+                            new EmbedBuilder()
+                                .setTitle(
+                                    "🔍 Authorization Check"
+                                )
+                                .setDescription(
+                                    `**${user.name}** is not authorized.`
+                                )
+                                .setColor(
+                                    getColor("red")
+                                )
+                                .setTimestamp()
                         ]
                     });
                 }
 
-                if (row.rban) {
+                const blocked =
+                    Boolean(
+                        record.rban
+                    );
 
-                    return interaction.reply({
-                        embeds: [
-                            errorEmbed(
-                                "rBanned",
-                                `**${roblox.name}** is blocked from authorization.`
-                            )
-                        ]
-                    });
-                }
+                const authorized =
+                    Boolean(
+                        record.authorized
+                    ) &&
+                    !blocked;
 
-                return interaction.reply({
+                return interaction.editReply({
                     embeds: [
-                        successEmbed(
-                            "Authorization Check",
-                            `**${roblox.name}** is currently **authorized**.`
-                        )
+                        new EmbedBuilder()
+                            .setTitle(
+                                "🔍 Authorization Check"
+                            )
+                            .setDescription(
+                                `**${user.name}**`
+                            )
+                            .addFields(
+                                {
+                                    name:
+                                        "Authorization",
+                                    value:
+                                        authorized
+                                            ? "✅ Authorized"
+                                            : "❌ Not Authorized",
+                                    inline: true
+                                },
+                                {
+                                    name:
+                                        "rBan",
+                                    value:
+                                        blocked
+                                            ? "🔴 Yes"
+                                            : "🟢 No",
+                                    inline: true
+                                },
+                                {
+                                    name:
+                                        "Source",
+                                    value:
+                                        record.authorization_source ||
+                                        "Unknown",
+                                    inline: true
+                                }
+                            )
+                            .setColor(
+                                authorized
+                                    ? getColor("green")
+                                    : getColor("red")
+                            )
+                            .setTimestamp()
                     ]
                 });
             }
 
 
-            /* ============================================
-               PROFILE
-            ============================================ */
+            /* ==========================================
+               /PROFILE
+            ========================================== */
 
             if (
                 interaction.commandName ===
@@ -2446,92 +3012,93 @@ client.on(
                 const username =
                     interaction.options
                         .getString(
-                            "username",
+                            "robloxuser",
                             true
                         );
 
-                const roblox =
+                await interaction.deferReply();
+
+                const user =
                     await getRobloxUser(
                         username
                     );
 
-                if (!roblox) {
+                if (!user) {
 
-                    return interaction.reply({
+                    return interaction.editReply({
                         embeds: [
                             errorEmbed(
                                 "User Not Found",
-                                `I couldn't find \`${username}\`.`
+                                "That Roblox user could not be found."
                             )
-                        ],
-                        ephemeral: true
+                        ]
                     });
                 }
 
                 const profile =
                     await getRobloxProfile(
-                        roblox.id
+                        user.id
                     );
 
                 const avatar =
                     await getRobloxAvatar(
-                        roblox.id
+                        user.id
                     );
 
-                const counts =
+                const friends =
                     await getRobloxFollowers(
-                        roblox.id
+                        user.id
                     );
 
                 const embed =
                     new EmbedBuilder()
                         .setTitle(
-                            `${roblox.name}'s Roblox Profile`
+                            `👤 ${user.name}`
+                        )
+                        .setURL(
+                            `https://www.roblox.com/users/${user.id}/profile`
+                        )
+                        .setThumbnail(
+                            avatar
                         )
                         .addFields(
                             {
-                                name: "Username",
+                                name:
+                                    "Display Name",
                                 value:
-                                    roblox.name,
+                                    profile?.displayName ||
+                                    user.displayName ||
+                                    user.name,
                                 inline: true
                             },
                             {
-                                name: "Display Name",
+                                name:
+                                    "User ID",
                                 value:
-                                    roblox.displayName ||
-                                    roblox.name,
+                                    `${user.id}`,
                                 inline: true
                             },
                             {
-                                name: "User ID",
+                                name:
+                                    "Followers",
                                 value:
-                                    String(
-                                        roblox.id
-                                    ),
+                                    `${friends.followers}`,
                                 inline: true
                             },
                             {
-                                name: "Followers",
+                                name:
+                                    "Following",
                                 value:
-                                    String(
-                                        counts.followers
-                                    ),
+                                    `${friends.following}`,
                                 inline: true
                             },
                             {
-                                name: "Following",
-                                value:
-                                    String(
-                                        counts.following
-                                    ),
-                                inline: true
-                            },
-                            {
-                                name: "Banned",
+                                name:
+                                    "Banned",
                                 value:
                                     profile?.isBanned
-                                        ? "Yes"
-                                        : "No",
+                                        ? "🔴 Yes"
+                                        : "🟢 No",
                                 inline: true
                             }
                         )
@@ -2540,49 +3107,67 @@ client.on(
                         )
                         .setTimestamp();
 
-                if (avatar) {
-                    embed.setThumbnail(
-                        avatar
-                    );
-                }
-
-                return interaction.reply({
+                return interaction.editReply({
                     embeds: [embed]
                 });
             }
 
 
-            /* ============================================
-               HISTORY
-            ============================================ */
+            /* ==========================================
+               /HISTORY
+            ========================================== */
 
             if (
                 interaction.commandName ===
                 "history"
             ) {
 
-                const username =
-                    interaction.options
-                        .getString(
-                            "username",
-                            true
-                        );
-
-                const roblox =
-                    await getRobloxUser(
-                        username
-                    );
-
-                if (!roblox) {
+                if (
+                    !canManageTickets(
+                        interaction.member,
+                        config
+                    ) &&
+                    !isFinancialOperations(
+                        interaction.member
+                    )
+                ) {
 
                     return interaction.reply({
                         embeds: [
                             errorEmbed(
-                                "User Not Found",
-                                `I couldn't find \`${username}\`.`
+                                "No Permission",
+                                "You do not have permission to view authorization history."
                             )
                         ],
                         ephemeral: true
+                    });
+                }
+
+                const username =
+                    interaction.options
+                        .getString(
+                            "robloxuser",
+                            true
+                        );
+
+                await interaction.deferReply({
+                    ephemeral: true
+                });
+
+                const user =
+                    await getRobloxUser(
+                        username
+                    );
+
+                if (!user) {
+
+                    return interaction.editReply({
+                        embeds: [
+                            errorEmbed(
+                                "User Not Found",
+                                "That Roblox user could not be found."
+                            )
+                        ]
                     });
                 }
 
@@ -2593,26 +3178,24 @@ client.on(
                         FROM authorization_history
                         WHERE roblox_user_id = $1
                         ORDER BY created_at DESC
-                        LIMIT 10
+                        LIMIT 15
                         `,
-                        [roblox.id]
+                        [user.id]
                     );
 
                 if (!result.rows.length) {
 
-                    return interaction.reply({
+                    return interaction.editReply({
                         embeds: [
                             new EmbedBuilder()
                                 .setTitle(
-                                    "Authorization History"
+                                    "📜 Authorization History"
                                 )
                                 .setDescription(
-                                    `No authorization history exists for **${roblox.name}**.`
+                                    `No history exists for **${user.name}**.`
                                 )
                                 .setColor(
-                                    getColor(
-                                        "blue"
-                                    )
+                                    getColor("dark")
                                 )
                         ]
                     });
@@ -2625,52 +3208,48 @@ client.on(
                             const date =
                                 new Date(
                                     row.created_at
-                                ).toLocaleString(
-                                    "en-GB"
                                 );
 
                             return (
                                 `**${row.action}** — ` +
-                                `${row.source || "unknown"} — ` +
-                                `${date}`
+                                `${row.source || "Unknown"}\n` +
+                                `<t:${Math.floor(
+                                    date.getTime() / 1000
+                                )}:R>`
                             );
-                        })
-                        .join("\n");
 
-                return interaction.reply({
+                        })
+                        .join("\n\n");
+
+                return interaction.editReply({
                     embeds: [
                         new EmbedBuilder()
                             .setTitle(
-                                `History — ${roblox.name}`
+                                `📜 History — ${user.name}`
                             )
                             .setDescription(
                                 description
                             )
                             .setColor(
-                                getColor(
-                                    "purple"
-                                )
+                                getColor("purple")
                             )
+                            .setTimestamp()
                     ]
                 });
             }
 
 
-            /* ============================================
-               ESCALATE COMMAND
-            ============================================ */
+            /* ==========================================
+               /ESCALATE
+            ========================================== */
 
             if (
                 interaction.commandName ===
                 "escalate"
             ) {
 
-                const config =
-                    await getTicketConfig(
-                        guild.id
-                    );
-
                 if (
+                    !config ||
                     !canManageTickets(
                         interaction.member,
                         config
@@ -2681,7 +3260,7 @@ client.on(
                         embeds: [
                             errorEmbed(
                                 "No Permission",
-                                "You need Support or Management."
+                                "You need Support or Management to escalate tickets."
                             )
                         ],
                         ephemeral: true
@@ -2699,7 +3278,7 @@ client.on(
                         embeds: [
                             errorEmbed(
                                 "Not A Ticket",
-                                "This command must be used inside a ticket."
+                                "This channel is not a ticket."
                             )
                         ],
                         ephemeral: true
@@ -2722,20 +3301,20 @@ client.on(
                 );
 
                 await interaction.reply({
+
                     content:
                         `<@&${MANAGER_ROLE_ID}>`,
+
                     embeds: [
                         new EmbedBuilder()
                             .setTitle(
                                 "⚠️ Ticket Escalated"
                             )
                             .setDescription(
-                                `${interaction.user} escalated this ticket.`
+                                `${interaction.user} has escalated this ticket.`
                             )
                             .setColor(
-                                getColor(
-                                    "orange"
-                                )
+                                getColor("orange")
                             )
                             .setTimestamp()
                     ]
@@ -2753,21 +3332,17 @@ client.on(
             }
 
 
-            /* ============================================
-               STATS
-            ============================================ */
+            /* ==========================================
+               /STATS
+            ========================================== */
 
             if (
                 interaction.commandName ===
                 "stats"
             ) {
 
-                const config =
-                    await getTicketConfig(
-                        guild.id
-                    );
-
                 if (
+                    !config ||
                     !canManageTickets(
                         interaction.member,
                         config
@@ -2778,7 +3353,7 @@ client.on(
                         embeds: [
                             errorEmbed(
                                 "No Permission",
-                                "You need Support or Management."
+                                "You need Support or Management to view ticket statistics."
                             )
                         ],
                         ephemeral: true
@@ -2830,43 +3405,36 @@ client.on(
                                     name:
                                         "Total Tickets",
                                     value:
-                                        String(
-                                            total.rows[0].count
-                                        ),
+                                        `${total.rows[0].count}`,
                                     inline: true
                                 },
                                 {
                                     name:
                                         "Open Tickets",
                                     value:
-                                        String(
-                                            open.rows[0].count
-                                        ),
+                                        `${open.rows[0].count}`,
                                     inline: true
                                 },
                                 {
                                     name:
                                         "Total Claims",
                                     value:
-                                        String(
-                                            claims.rows[0].count
-                                        ),
+                                        `${claims.rows[0].count}`,
                                     inline: true
                                 }
                             )
                             .setColor(
-                                getColor(
-                                    "blue"
-                                )
+                                getColor("blue")
                             )
+                            .setTimestamp()
                     ]
                 });
             }
 
 
-            /* ============================================
-               WIPE TICKETS
-            ============================================ */
+            /* ==========================================
+               /WIPE TICKETS
+            ========================================== */
 
             if (
                 interaction.commandName ===
@@ -2883,7 +3451,7 @@ client.on(
                         embeds: [
                             errorEmbed(
                                 "No Permission",
-                                "You need Financial Operations."
+                                "Only Financial Operations can wipe ticket claim statistics."
                             )
                         ],
                         ephemeral: true
@@ -2891,10 +3459,11 @@ client.on(
                 }
 
                 const user =
-                    interaction.options.getUser(
-                        "user",
-                        true
-                    );
+                    interaction.options
+                        .getUser(
+                            "user",
+                            true
+                        );
 
                 await wipeClaims(
                     guild.id,
@@ -2904,8 +3473,10 @@ client.on(
                 await interaction.reply({
                     embeds: [
                         successEmbed(
-                            "Claims Wiped",
-                            `All ticket claim statistics for ${user} have been wiped.`
+                            "Statistics Wiped",
+                            `All ticket claim statistics for ${user} have been wiped.`,
+                            config?.success_color ||
+                            "green"
                         )
                     ]
                 });
@@ -2918,9 +3489,9 @@ client.on(
             }
 
 
-            /* ============================================
-               TICKET COMMAND
-            ============================================ */
+            /* ==========================================
+               /TICKET
+            ========================================== */
 
             if (
                 interaction.commandName ===
@@ -2931,15 +3502,10 @@ client.on(
                     interaction.options
                         .getSubcommand();
 
-                const config =
-                    await getTicketConfig(
-                        guild.id
-                    );
 
-
-                /* ========================================
-                   SETUP
-                ======================================== */
+                /* ======================================
+                   /TICKET SETUP
+                ====================================== */
 
                 if (
                     subcommand ===
@@ -2956,7 +3522,7 @@ client.on(
                             embeds: [
                                 errorEmbed(
                                     "No Permission",
-                                    "You need Financial Operations to setup tickets."
+                                    "Only Financial Operations can configure the ticket system."
                                 )
                             ],
                             ephemeral: true
@@ -2987,44 +3553,50 @@ client.on(
                     const logChannel =
                         interaction.options
                             .getChannel(
-                                "log_channel",
-                                true
+                                "log_channel"
                             );
+
+                    const panelChannel =
+                        interaction.options
+                            .getChannel(
+                                "panel_channel"
+                            ) ||
+                        interaction.channel;
 
                     const panelColor =
                         interaction.options
                             .getString(
-                                "panel_color",
-                                true
-                            );
+                                "panel_color"
+                            ) ||
+                        "blue";
 
                     const ticketColor =
                         interaction.options
                             .getString(
-                                "ticket_color",
-                                true
-                            );
+                                "ticket_color"
+                            ) ||
+                        "blue";
 
                     const successColor =
                         interaction.options
                             .getString(
-                                "success_color",
-                                true
-                            );
+                                "success_color"
+                            ) ||
+                        "green";
 
                     const errorColor =
                         interaction.options
                             .getString(
-                                "error_color",
-                                true
-                            );
+                                "error_color"
+                            ) ||
+                        "red";
 
                     const leaderboardColor =
                         interaction.options
                             .getString(
-                                "leaderboard_color",
-                                true
-                            );
+                                "leaderboard_color"
+                            ) ||
+                        "purple";
 
                     await query(
                         `
@@ -3042,12 +3614,14 @@ client.on(
                             leaderboard_color
                         )
                         VALUES (
-                            $1,$2,$3,$4,$5,
-                            $6,$7,$8,$9,$10,$11
+                            $1,$2,$3,$4,$5,$6,
+                            $7,$8,$9,$10,$11
                         )
 
                         ON CONFLICT (guild_id)
+
                         DO UPDATE SET
+
                             support_role_id =
                                 EXCLUDED.support_role_id,
 
@@ -3083,8 +3657,9 @@ client.on(
                             supportRole.id,
                             managementRole.id,
                             category.id,
-                            logChannel.id,
-                            interaction.channel.id,
+                            logChannel?.id ||
+                                null,
+                            panelChannel.id,
                             panelColor,
                             ticketColor,
                             successColor,
@@ -3093,44 +3668,56 @@ client.on(
                         ]
                     );
 
-                    const newConfig =
+                    const updatedConfig =
                         await getTicketConfig(
                             guild.id
                         );
 
-                    await sendTicketPanel(
-                        interaction,
-                        newConfig
+                    const panel =
+                        await panelChannel.send(
+                            ticketPanel(
+                                updatedConfig
+                            )
+                        );
+
+                    await query(
+                        `
+                        UPDATE ticket_config
+                        SET
+                            panel_message_id = $1
+                        WHERE guild_id = $2
+                        `,
+                        [
+                            panel.id,
+                            guild.id
+                        ]
                     );
 
-                    await interaction.reply({
+                    return interaction.reply({
                         embeds: [
                             successEmbed(
-                                "Ticket System Setup",
-                                "The ticket system has been configured and the panel has been created."
+                                "Ticket System Configured",
+                                `Support: ${supportRole}\nManagement: ${managementRole}\nCategory: ${category}\nPanel: ${panelChannel}`,
+                                successColor
                             )
                         ],
                         ephemeral: true
                     });
-
-                    await updateLeaderboard(
-                        guild
-                    );
-
-                    return;
                 }
 
 
-                /* ========================================
-                   PANEL
-                ======================================== */
+                /* ======================================
+                   /TICKET PANEL
+                ====================================== */
 
                 if (
                     subcommand ===
                     "panel"
                 ) {
 
-                    if (!config) {
+                    if (
+                        !config
+                    ) {
 
                         return interaction.reply({
                             embeds: [
@@ -3146,10 +3733,6 @@ client.on(
                     if (
                         !isFinancialOperations(
                             interaction.member
-                        ) &&
-                        !isSupport(
-                            interaction.member,
-                            config
                         )
                     ) {
 
@@ -3157,23 +3740,48 @@ client.on(
                             embeds: [
                                 errorEmbed(
                                     "No Permission",
-                                    "You need Financial Operations or Support."
+                                    "Only Financial Operations can send the ticket panel."
                                 )
                             ],
                             ephemeral: true
                         });
                     }
 
-                    await sendTicketPanel(
-                        interaction,
-                        config
+                    const channel =
+                        interaction.options
+                            .getChannel(
+                                "channel"
+                            ) ||
+                        interaction.channel;
+
+                    const message =
+                        await channel.send(
+                            ticketPanel(
+                                config
+                            )
+                        );
+
+                    await query(
+                        `
+                        UPDATE ticket_config
+                        SET
+                            panel_channel_id = $1,
+                            panel_message_id = $2
+                        WHERE guild_id = $3
+                        `,
+                        [
+                            channel.id,
+                            message.id,
+                            guild.id
+                        ]
                     );
 
                     return interaction.reply({
                         embeds: [
                             successEmbed(
                                 "Panel Sent",
-                                "The ticket panel has been sent."
+                                `Ticket panel sent to ${channel}.`,
+                                config.success_color
                             )
                         ],
                         ephemeral: true
@@ -3181,32 +3789,9 @@ client.on(
                 }
 
 
-                /* ========================================
-                   CURRENT TICKET
-                ======================================== */
-
-                const ticket =
-                    await getCurrentTicket(
-                        interaction.channel.id
-                    );
-
-                if (!ticket) {
-
-                    return interaction.reply({
-                        embeds: [
-                            errorEmbed(
-                                "Not A Ticket",
-                                "This command must be used inside a ticket."
-                            )
-                        ],
-                        ephemeral: true
-                    });
-                }
-
-
-                /* ========================================
-                   CLAIM
-                ======================================== */
+                /* ======================================
+                   /TICKET CLAIM
+                ====================================== */
 
                 if (
                     subcommand ===
@@ -3214,6 +3799,7 @@ client.on(
                 ) {
 
                     if (
+                        !config ||
                         !canManageTickets(
                             interaction.member,
                             config
@@ -3224,7 +3810,25 @@ client.on(
                             embeds: [
                                 errorEmbed(
                                     "No Permission",
-                                    "You need Support or Management."
+                                    "You need Support or Management to claim tickets."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    const ticket =
+                        await getCurrentTicket(
+                            interaction.channel.id
+                        );
+
+                    if (!ticket) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Not A Ticket",
+                                    "This channel is not a ticket."
                                 )
                             ],
                             ephemeral: true
@@ -3232,9 +3836,7 @@ client.on(
                     }
 
                     if (
-                        ticket.claimer_id &&
-                        ticket.claimer_id !==
-                            interaction.user.id
+                        ticket.claimer_id
                     ) {
 
                         return interaction.reply({
@@ -3269,11 +3871,77 @@ client.on(
                         interaction.user.tag
                     );
 
+                    /*
+                       LOCK THE SUPPORT / MANAGEMENT
+                       ROLES AFTER CLAIM.
+                    */
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.support_role_id,
+                            {
+                                SendMessages: false,
+                                AddReactions: false
+                            }
+                        )
+                        .catch(() => {});
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.management_role_id,
+                            {
+                                SendMessages: false,
+                                AddReactions: false
+                            }
+                        )
+                        .catch(() => {});
+
+                    /*
+                       CLIENT CAN TALK.
+                    */
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            ticket.opener_id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true,
+                                AttachFiles: true,
+                                EmbedLinks: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    /*
+                       CLAIMED STAFF MEMBER CAN TALK.
+                    */
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            interaction.user.id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true,
+                                AttachFiles: true,
+                                EmbedLinks: true
+                            }
+                        )
+                        .catch(() => {});
+
                     await interaction.reply({
                         embeds: [
                             successEmbed(
                                 "Ticket Claimed",
-                                `${interaction.user} has claimed this ticket.`
+                                `${interaction.user} has claimed this ticket.\n\nOnly the client and assigned staff member can speak until another staff member is approved through **Request to Join**.`,
+                                config.success_color
                             )
                         ]
                     });
@@ -3286,16 +3954,17 @@ client.on(
                 }
 
 
-                /* ========================================
-                   UNCLAIM
-                ======================================== */
+                /* ======================================
+                   /TICKET CLOSE
+                ====================================== */
 
                 if (
                     subcommand ===
-                    "unclaim"
+                    "close"
                 ) {
 
                     if (
+                        !config ||
                         !canManageTickets(
                             interaction.member,
                             config
@@ -3306,43 +3975,37 @@ client.on(
                             embeds: [
                                 errorEmbed(
                                     "No Permission",
-                                    "You need Support or Management."
+                                    "You need Support or Management to close tickets."
                                 )
                             ],
                             ephemeral: true
                         });
                     }
 
-                    if (
-                        !ticket.claimer_id
-                    ) {
+                    const ticket =
+                        await getCurrentTicket(
+                            interaction.channel.id
+                        );
+
+                    if (!ticket) {
 
                         return interaction.reply({
                             embeds: [
                                 errorEmbed(
-                                    "Not Claimed",
-                                    "This ticket is not currently claimed."
+                                    "Not A Ticket",
+                                    "This channel is not a ticket."
                                 )
                             ],
                             ephemeral: true
                         });
                     }
-
-                    const oldClaimer =
-                        ticket.claimer_id;
 
                     await query(
                         `
                         UPDATE tickets
                         SET
-                            claimer_id = NULL,
-                            claimed_at = NULL,
-                            status =
-                                CASE
-                                    WHEN status = 'escalated'
-                                    THEN 'escalated'
-                                    ELSE 'open'
-                                END
+                            status = 'closed',
+                            closed_at = NOW()
                         WHERE channel_id = $1
                         `,
                         [
@@ -3353,34 +4016,34 @@ client.on(
                     await interaction.reply({
                         embeds: [
                             successEmbed(
-                                "Ticket Unclaimed",
-                                `<@${oldClaimer}> is no longer assigned to this ticket.`
+                                "Ticket Closed",
+                                "The client has been asked for feedback. The ticket will automatically be deleted after 10 minutes if there is no response.",
+                                config.success_color
                             )
                         ]
                     });
 
-                    await logTicket(
+                    await requestTicketFeedback(
                         guild,
-                        config,
-                        "Ticket Unclaimed",
-                        `${interaction.user} unclaimed ${interaction.channel}.`,
-                        "orange"
+                        interaction.channel,
+                        ticket
                     );
 
                     return;
                 }
 
 
-                /* ========================================
-                   CLOSE
-                ======================================== */
+                /* ======================================
+                   /TICKET UNCLAIM
+                ====================================== */
 
                 if (
                     subcommand ===
-                    "close"
+                    "unclaim"
                 ) {
 
                     if (
+                        !config ||
                         !canManageTickets(
                             interaction.member,
                             config
@@ -3391,26 +4054,116 @@ client.on(
                             embeds: [
                                 errorEmbed(
                                     "No Permission",
-                                    "You need Support or Management."
+                                    "You need Support or Management to unclaim tickets."
                                 )
                             ],
                             ephemeral: true
                         });
                     }
 
-                    await beginFeedbackFlow(
-                        interaction,
-                        ticket,
-                        config
+                    const ticket =
+                        await getCurrentTicket(
+                            interaction.channel.id
+                        );
+
+                    if (!ticket) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Not A Ticket",
+                                    "This channel is not a ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    if (
+                        ticket.claimer_id !==
+                            interaction.user.id &&
+                        !isManagement(
+                            interaction.member,
+                            config
+                        )
+                    ) {
+
+                        return interaction.reply({
+                            embeds: [
+                                errorEmbed(
+                                    "Not Your Ticket",
+                                    "Only the claimed staff member or Management can unclaim this ticket."
+                                )
+                            ],
+                            ephemeral: true
+                        });
+                    }
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            claimer_id = NULL,
+                            claimed_at = NULL,
+                            status = 'open'
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
                     );
 
-                    return;
+                    await query(
+                        `
+                        DELETE FROM ticket_join_requests
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            interaction.channel.id
+                        ]
+                    );
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.support_role_id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    await interaction.channel
+                        .permissionOverwrites
+                        .edit(
+                            config.management_role_id,
+                            {
+                                ViewChannel: true,
+                                SendMessages: true,
+                                ReadMessageHistory: true,
+                                AddReactions: true
+                            }
+                        )
+                        .catch(() => {});
+
+                    return interaction.reply({
+                        embeds: [
+                            successEmbed(
+                                "Ticket Unclaimed",
+                                "The ticket is open again and Support can respond.",
+                                config.success_color
+                            )
+                        ]
+                    });
                 }
 
 
-                /* ========================================
-                   RENAME
-                ======================================== */
+                /* ======================================
+                   /TICKET RENAME
+                ====================================== */
 
                 if (
                     subcommand ===
@@ -3418,6 +4171,7 @@ client.on(
                 ) {
 
                     if (
+                        !config ||
                         !isSupport(
                             interaction.member,
                             config
@@ -3443,7 +4197,7 @@ client.on(
                             )
                             .toLowerCase()
                             .replace(
-                                /[^a-z0-9-_]/g,
+                                /[^a-z0-9-]/g,
                                 "-"
                             )
                             .slice(0, 90);
@@ -3455,16 +4209,17 @@ client.on(
                         embeds: [
                             successEmbed(
                                 "Ticket Renamed",
-                                `The ticket has been renamed to \`${name}\`.`
+                                `The ticket has been renamed to **${name}**.`,
+                                config.success_color
                             )
                         ]
                     });
                 }
 
 
-                /* ========================================
-                   ADD USER
-                ======================================== */
+                /* ======================================
+                   /TICKET ADD
+                ====================================== */
 
                 if (
                     subcommand ===
@@ -3472,6 +4227,7 @@ client.on(
                 ) {
 
                     if (
+                        !config ||
                         !isSupport(
                             interaction.member,
                             config
@@ -3503,7 +4259,10 @@ client.on(
                             {
                                 ViewChannel: true,
                                 SendMessages: true,
-                                ReadMessageHistory: true
+                                ReadMessageHistory: true,
+                                AddReactions: true,
+                                AttachFiles: true,
+                                EmbedLinks: true
                             }
                         );
 
@@ -3511,16 +4270,17 @@ client.on(
                         embeds: [
                             successEmbed(
                                 "User Added",
-                                `${user} has been added to this ticket.`
+                                `${user} has been added to this ticket.`,
+                                config.success_color
                             )
                         ]
                     });
                 }
 
 
-                /* ========================================
-                   REMOVE USER
-                ======================================== */
+                /* ======================================
+                   /TICKET REMOVE
+                ====================================== */
 
                 if (
                     subcommand ===
@@ -3528,6 +4288,7 @@ client.on(
                 ) {
 
                     if (
+                        !config ||
                         !isSupport(
                             interaction.member,
                             config
@@ -3552,16 +4313,21 @@ client.on(
                                 true
                             );
 
+                    const ticket =
+                        await getCurrentTicket(
+                            interaction.channel.id
+                        );
+
                     if (
-                        user.id ===
-                        ticket.opener_id
+                        ticket?.opener_id ===
+                        user.id
                     ) {
 
                         return interaction.reply({
                             embeds: [
                                 errorEmbed(
-                                    "Cannot Remove",
-                                    "You cannot remove the ticket opener."
+                                    "Cannot Remove Client",
+                                    "The ticket opener cannot be removed from their own ticket."
                                 )
                             ],
                             ephemeral: true
@@ -3579,7 +4345,8 @@ client.on(
                         embeds: [
                             successEmbed(
                                 "User Removed",
-                                `${user} has been removed from this ticket.`
+                                `${user} has been removed from this ticket.`,
+                                config.success_color
                             )
                         ]
                     });
@@ -3589,37 +4356,873 @@ client.on(
         } catch (error) {
 
             console.error(
-                "[INTERACTION ERROR]",
+                "[SLASH COMMAND ERROR]",
                 error
             );
-
-            const embed =
-                errorEmbed(
-                    "Error",
-                    "Something went wrong while processing that request."
-                );
 
             if (
                 interaction.replied ||
                 interaction.deferred
             ) {
 
-                await interaction
-                    .followUp({
-                        embeds: [embed],
-                        ephemeral: true
-                    })
-                    .catch(() => {});
+                await interaction.followUp({
+                    embeds: [
+                        errorEmbed(
+                            "Error",
+                            "Something went wrong while processing the command."
+                        )
+                    ],
+                    ephemeral: true
+                }).catch(() => {});
 
             } else {
 
-                await interaction
-                    .reply({
-                        embeds: [embed],
-                        ephemeral: true
-                    })
-                    .catch(() => {});
+                await interaction.reply({
+                    embeds: [
+                        errorEmbed(
+                            "Error",
+                            "Something went wrong while processing the command."
+                        )
+                    ],
+                    ephemeral: true
+                }).catch(() => {});
             }
+        }
+    }
+);
+
+
+/* =========================================================
+   TICKET CREATE BUTTON
+========================================================= */
+
+client.on(
+    "interactionCreate",
+    async interaction => {
+
+        if (
+            !interaction.isButton() ||
+            interaction.customId !==
+                "ticket_create"
+        ) {
+            return;
+        }
+
+        try {
+
+            const guild =
+                interaction.guild;
+
+            if (!guild) {
+                return;
+            }
+
+            const config =
+                await getTicketConfig(
+                    guild.id
+                );
+
+            if (!config) {
+
+                return interaction.reply({
+                    embeds: [
+                        errorEmbed(
+                            "Not Configured",
+                            "The ticket system has not been configured yet."
+                        )
+                    ],
+                    ephemeral: true
+                });
+            }
+
+            await interaction.deferReply({
+                ephemeral: true
+            });
+
+            const result =
+                await createTicket(
+                    interaction,
+                    config
+                );
+
+            if (!result.success) {
+
+                if (result.channel) {
+
+                    return interaction.editReply({
+                        embeds: [
+                            errorEmbed(
+                                "Ticket Already Open",
+                                `You already have an open ticket: ${result.channel}`
+                            )
+                        ]
+                    });
+                }
+
+                return interaction.editReply({
+                    embeds: [
+                        errorEmbed(
+                            "Unable To Create",
+                            "Your ticket could not be created."
+                        )
+                    ]
+                });
+            }
+
+            await interaction.editReply({
+                embeds: [
+                    successEmbed(
+                        "Ticket Created",
+                        `Your ticket has been created: ${result.channel}`,
+                        config.success_color
+                    )
+                ]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[CREATE TICKET ERROR]",
+                error
+            );
+
+            if (
+                interaction.deferred
+            ) {
+
+                await interaction.editReply({
+                    embeds: [
+                        errorEmbed(
+                            "Error",
+                            "Something went wrong while creating your ticket."
+                        )
+                    ]
+                }).catch(() => {});
+
+            } else {
+
+                await interaction.reply({
+                    embeds: [
+                        errorEmbed(
+                            "Error",
+                            "Something went wrong while creating your ticket."
+                        )
+                    ],
+                    ephemeral: true
+                }).catch(() => {});
+            }
+        }
+    }
+);
+
+
+/* =========================================================
+   DIRECT MESSAGE FEEDBACK
+========================================================= */
+
+client.on(
+    "messageCreate",
+    async message => {
+
+        try {
+
+            if (message.author.bot) {
+                return;
+            }
+
+            if (
+                message.channel.type !==
+                ChannelType.DM
+            ) {
+                return;
+            }
+
+            const pending =
+                pendingFeedback.get(
+                    message.author.id
+                );
+
+            if (!pending) {
+                return;
+            }
+
+            if (pending.timeout) {
+                clearTimeout(
+                    pending.timeout
+                );
+            }
+
+            pendingFeedback.delete(
+                message.author.id
+            );
+
+            await sendFeedbackToStaff(
+                message,
+                pending
+            );
+
+            const guild =
+                client.guilds.cache.get(
+                    pending.guildId
+                );
+
+            const ticketChannel =
+                guild?.channels.cache.get(
+                    pending.channelId
+                );
+
+            if (!ticketChannel) {
+                return;
+            }
+
+            const closeTimeout =
+                setTimeout(
+                    async () => {
+
+                        pendingClose.delete(
+                            message.author.id
+                        );
+
+                        await finishTicketClose(
+                            ticketChannel,
+                            message.author.id
+                        );
+
+                    },
+                    10 * 60 * 1000
+                );
+
+            pendingClose.set(
+                message.author.id,
+                {
+                    channelId:
+                        pending.channelId,
+
+                    guildId:
+                        pending.guildId,
+
+                    timeout:
+                        closeTimeout
+                }
+            );
+
+            await message.author.send({
+
+                embeds: [
+
+                    new EmbedBuilder()
+                        .setTitle(
+                            "⭐ Feedback Received"
+                        )
+                        .setDescription(
+                            "Thank you for your feedback.\n\n" +
+                            "Would you like the ticket to be deleted, or would you like to keep it open?"
+                        )
+                        .setColor(
+                            getColor("green")
+                        )
+                        .setTimestamp()
+                ],
+
+                components: [
+                    closeChoiceButtons()
+                ]
+            });
+
+        } catch (error) {
+
+            console.error(
+                "[DM FEEDBACK ERROR]",
+                error
+            );
+        }
+    }
+);
+
+
+/* =========================================================
+   DM FEEDBACK BUTTONS
+========================================================= */
+
+client.on(
+    "interactionCreate",
+    async interaction => {
+
+        if (
+            !interaction.isButton()
+        ) {
+            return;
+        }
+
+        if (
+            interaction.customId !==
+                "feedback_close_yes" &&
+            interaction.customId !==
+                "feedback_close_no"
+        ) {
+            return;
+        }
+
+        if (interaction.guild) {
+            return;
+        }
+
+        try {
+
+            const pending =
+                pendingClose.get(
+                    interaction.user.id
+                );
+
+            if (!pending) {
+
+                return interaction.reply({
+                    content:
+                        "This ticket is no longer waiting for a close decision.",
+                    ephemeral: true
+                });
+            }
+
+            if (
+                pending.timeout
+            ) {
+
+                clearTimeout(
+                    pending.timeout
+                );
+            }
+
+            pendingClose.delete(
+                interaction.user.id
+            );
+
+            const guild =
+                client.guilds.cache.get(
+                    pending.guildId
+                );
+
+            const channel =
+                guild?.channels.cache.get(
+                    pending.channelId
+                );
+
+            if (
+                interaction.customId ===
+                "feedback_close_yes"
+            ) {
+
+                await interaction.update({
+
+                    embeds: [
+
+                        new EmbedBuilder()
+                            .setTitle(
+                                "🔒 Ticket Closed"
+                            )
+                            .setDescription(
+                                "The ticket will now be deleted."
+                            )
+                            .setColor(
+                                getColor("red")
+                            )
+                            .setTimestamp()
+                    ],
+
+                    components: []
+                });
+
+                if (channel) {
+
+                    await query(
+                        `
+                        UPDATE tickets
+                        SET
+                            status = 'closed',
+                            closed_at = NOW()
+                        WHERE channel_id = $1
+                        `,
+                        [
+                            pending.channelId
+                        ]
+                    );
+
+                    setTimeout(
+                        async () => {
+
+                            await channel
+                                .delete()
+                                .catch(() => {});
+
+                        },
+                        3000
+                    );
+                }
+
+                return;
+            }
+
+            /*
+               NO = KEEP TICKET OPEN.
+            */
+
+            if (channel) {
+
+                await query(
+                    `
+                    UPDATE tickets
+                    SET
+                        status =
+                            CASE
+                                WHEN claimer_id IS NULL
+                                THEN 'open'
+                                ELSE 'claimed'
+                            END,
+                        closed_at = NULL
+                    WHERE channel_id = $1
+                    `,
+                    [
+                        pending.channelId
+                    ]
+                );
+
+                await interaction.update({
+
+                    embeds: [
+
+                        new EmbedBuilder()
+                            .setTitle(
+                                "↩️ Ticket Kept Open"
+                            )
+                            .setDescription(
+                                "The ticket has been kept open."
+                            )
+                            .setColor(
+                                getColor("green")
+                            )
+                            .setTimestamp()
+                    ],
+
+                    components: []
+                });
+
+            } else {
+
+                await interaction.update({
+
+                    embeds: [
+
+                        new EmbedBuilder()
+                            .setTitle(
+                                "Ticket Not Found"
+                            )
+                            .setDescription(
+                                "The ticket could not be found."
+                            )
+                            .setColor(
+                                getColor("red")
+                            )
+                            .setTimestamp()
+                    ],
+
+                    components: []
+                });
+            }
+
+        } catch (error) {
+
+            console.error(
+                "[DM BUTTON ERROR]",
+                error
+            );
+
+            if (
+                interaction.replied ||
+                interaction.deferred
+            ) {
+
+                await interaction.followUp({
+                    content:
+                        "Something went wrong.",
+                    ephemeral: true
+                }).catch(() => {});
+
+            } else {
+
+                await interaction.reply({
+                    content:
+                        "Something went wrong.",
+                    ephemeral: true
+                }).catch(() => {});
+            }
+        }
+    }
+);
+
+
+/* =========================================================
+   SLASH COMMAND DEFINITIONS
+========================================================= */
+
+const commands = [
+
+    new SlashCommandBuilder()
+        .setName("auth")
+        .setDescription(
+            "Authorize a Roblox user"
+        )
+        .addStringOption(option =>
+            option
+                .setName("robloxuser")
+                .setDescription(
+                    "Roblox username"
+                )
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("check")
+        .setDescription(
+            "Check Roblox authorization"
+        )
+        .addStringOption(option =>
+            option
+                .setName("robloxuser")
+                .setDescription(
+                    "Roblox username"
+                )
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("profile")
+        .setDescription(
+            "View a Roblox profile"
+        )
+        .addStringOption(option =>
+            option
+                .setName("robloxuser")
+                .setDescription(
+                    "Roblox username"
+                )
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("history")
+        .setDescription(
+            "View authorization history"
+        )
+        .addStringOption(option =>
+            option
+                .setName("robloxuser")
+                .setDescription(
+                    "Roblox username"
+                )
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("escalate")
+        .setDescription(
+            "Escalate the current ticket"
+        ),
+
+    new SlashCommandBuilder()
+        .setName("stats")
+        .setDescription(
+            "View ticket statistics"
+        ),
+
+    new SlashCommandBuilder()
+        .setName("wipetickets")
+        .setDescription(
+            "Wipe ticket claim statistics"
+        )
+        .addUserOption(option =>
+            option
+                .setName("user")
+                .setDescription(
+                    "Staff member"
+                )
+                .setRequired(true)
+        ),
+
+    new SlashCommandBuilder()
+        .setName("ticket")
+        .setDescription(
+            "Ticket management"
+        )
+        .addSubcommand(sub =>
+            sub
+                .setName("setup")
+                .setDescription(
+                    "Configure the ticket system"
+                )
+                .addRoleOption(option =>
+                    option
+                        .setName("support_role")
+                        .setDescription(
+                            "Support role"
+                        )
+                        .setRequired(true)
+                )
+                .addRoleOption(option =>
+                    option
+                        .setName("management_role")
+                        .setDescription(
+                            "Management role"
+                        )
+                        .setRequired(true)
+                )
+                .addChannelOption(option =>
+                    option
+                        .setName("category")
+                        .setDescription(
+                            "Ticket category"
+                        )
+                        .addChannelTypes(
+                            ChannelType.GuildCategory
+                        )
+                        .setRequired(true)
+                )
+                .addChannelOption(option =>
+                    option
+                        .setName("log_channel")
+                        .setDescription(
+                            "Ticket log channel"
+                        )
+                        .addChannelTypes(
+                            ChannelType.GuildText
+                        )
+                )
+                .addChannelOption(option =>
+                    option
+                        .setName("panel_channel")
+                        .setDescription(
+                            "Ticket panel channel"
+                        )
+                        .addChannelTypes(
+                            ChannelType.GuildText
+                        )
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("panel_color")
+                        .setDescription(
+                            "Panel color"
+                        )
+                        .addChoices(
+                            ...Object.keys(
+                                COLORS
+                            ).map(color => ({
+                                name:
+                                    color
+                                        .charAt(0)
+                                        .toUpperCase() +
+                                    color.slice(1),
+                                value:
+                                    color
+                            }))
+                        )
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("ticket_color")
+                        .setDescription(
+                            "Ticket color"
+                        )
+                        .addChoices(
+                            ...Object.keys(
+                                COLORS
+                            ).map(color => ({
+                                name:
+                                    color
+                                        .charAt(0)
+                                        .toUpperCase() +
+                                    color.slice(1),
+                                value:
+                                    color
+                            }))
+                        )
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("success_color")
+                        .setDescription(
+                            "Success color"
+                        )
+                        .addChoices(
+                            ...Object.keys(
+                                COLORS
+                            ).map(color => ({
+                                name:
+                                    color
+                                        .charAt(0)
+                                        .toUpperCase() +
+                                    color.slice(1),
+                                value:
+                                    color
+                            }))
+                        )
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("error_color")
+                        .setDescription(
+                            "Error color"
+                        )
+                        .addChoices(
+                            ...Object.keys(
+                                COLORS
+                            ).map(color => ({
+                                name:
+                                    color
+                                        .charAt(0)
+                                        .toUpperCase() +
+                                    color.slice(1),
+                                value:
+                                    color
+                            }))
+                        )
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("leaderboard_color")
+                        .setDescription(
+                            "Leaderboard color"
+                        )
+                        .addChoices(
+                            ...Object.keys(
+                                COLORS
+                            ).map(color => ({
+                                name:
+                                    color
+                                        .charAt(0)
+                                        .toUpperCase() +
+                                    color.slice(1),
+                                value:
+                                    color
+                            }))
+                        )
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("panel")
+                .setDescription(
+                    "Send the ticket panel"
+                )
+                .addChannelOption(option =>
+                    option
+                        .setName("channel")
+                        .setDescription(
+                            "Channel to send the panel"
+                        )
+                        .addChannelTypes(
+                            ChannelType.GuildText
+                        )
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("claim")
+                .setDescription(
+                    "Claim the current ticket"
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("close")
+                .setDescription(
+                    "Close the current ticket"
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("unclaim")
+                .setDescription(
+                    "Unclaim the current ticket"
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("rename")
+                .setDescription(
+                    "Rename the current ticket"
+                )
+                .addStringOption(option =>
+                    option
+                        .setName("name")
+                        .setDescription(
+                            "New ticket name"
+                        )
+                        .setRequired(true)
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("add")
+                .setDescription(
+                    "Add a user to the ticket"
+                )
+                .addUserOption(option =>
+                    option
+                        .setName("user")
+                        .setDescription(
+                            "User to add"
+                        )
+                        .setRequired(true)
+                )
+        )
+
+        .addSubcommand(sub =>
+            sub
+                .setName("remove")
+                .setDescription(
+                    "Remove a user from the ticket"
+                )
+                .addUserOption(option =>
+                    option
+                        .setName("user")
+                        .setDescription(
+                            "User to remove"
+                        )
+                        .setRequired(true)
+                )
+        )
+].map(command => command.toJSON());
+
+
+/* =========================================================
+   REGISTER COMMANDS
+========================================================= */
+
+client.once(
+    "clientReady",
+    async () => {
+
+        try {
+
+            await client.application.commands.set(
+                commands
+            );
+
+            console.log(
+                "[DISCORD] Slash commands registered."
+            );
+
+        } catch (error) {
+
+            console.error(
+                "[COMMAND REGISTRATION ERROR]",
+                error
+            );
         }
     }
 );
@@ -3629,7 +5232,8 @@ client.on(
    EXPRESS API
 ========================================================= */
 
-const app = express();
+const app =
+    express();
 
 app.use(
     express.json()
@@ -3642,90 +5246,85 @@ app.get(
         res.json({
             status: "online",
             service: "Devil",
-            bot:
-                client.user
-                    ? client.user.tag
-                    : "starting"
+            discord:
+                client.isReady()
+                    ? "online"
+                    : "connecting"
         });
     }
 );
 
 
 /* =========================================================
-   API AUTHENTICATION
+   API AUTH
 ========================================================= */
 
-function checkApiSecret(req, res) {
+function checkApiSecret(
+    req
+) {
 
     const supplied =
         req.headers[
             "x-api-secret"
         ] ||
-        req.body?.api_secret;
+        req.headers[
+            "authorization"
+        ]?.replace(
+            /^Bearer\s+/i,
+            ""
+        );
 
-    if (
-        !supplied ||
-        supplied !== API_SECRET
-    ) {
-
-        res.status(401).json({
-            success: false,
-            error: "Unauthorized"
-        });
-
-        return false;
-    }
-
-    return true;
+    return (
+        supplied === API_SECRET
+    );
 }
 
 
 /* =========================================================
-   CHECK AUTHORIZATION API
+   GET /CHECK
 ========================================================= */
 
 app.get(
     "/check",
     async (req, res) => {
 
+        if (
+            !checkApiSecret(req)
+        ) {
+
+            return res
+                .status(401)
+                .json({
+                    error:
+                        "Unauthorized"
+                });
+        }
+
         try {
 
-            if (
-                !checkApiSecret(
-                    req,
-                    res
-                )
-            ) {
-                return;
-            }
-
             const username =
-                String(
-                    req.query.username ||
-                    ""
-                ).trim();
+                req.query.username;
 
             if (!username) {
 
-                return res.status(400)
+                return res
+                    .status(400)
                     .json({
-                        success: false,
                         error:
                             "Missing username"
                     });
             }
 
-            const roblox =
+            const user =
                 await getRobloxUser(
                     username
                 );
 
-            if (!roblox) {
+            if (!user) {
 
-                return res.status(404)
+                return res
+                    .status(404)
                     .json({
-                        success: false,
-                        authorized: false,
                         error:
                             "Roblox user not found"
                     });
@@ -3734,59 +5333,59 @@ app.get(
             const result =
                 await query(
                     `
-                    SELECT
-                        roblox_username,
-                        roblox_user_id,
-                        discord_user_id,
-                        authorized,
-                        authorization_source,
-                        authorized_at,
-                        rban
+                    SELECT *
                     FROM authorizations
                     WHERE roblox_user_id = $1
                     `,
-                    [roblox.id]
+                    [user.id]
                 );
 
-            if (
-                !result.rows.length
-            ) {
+            const record =
+                result.rows[0];
+
+            if (!record) {
 
                 return res.json({
-                    success: true,
-                    authorized: false,
-                    rban: false,
                     username:
-                        roblox.name,
-                    roblox_user_id:
-                        roblox.id
+                        user.name,
+
+                    userId:
+                        user.id,
+
+                    authorized:
+                        false,
+
+                    rban:
+                        false
                 });
             }
 
-            const row =
-                result.rows[0];
-
             return res.json({
-                success: true,
+
+                username:
+                    record.roblox_username,
+
+                userId:
+                    record.roblox_user_id,
+
                 authorized:
                     Boolean(
-                        row.authorized &&
-                        !row.rban
+                        record.authorized
+                    ) &&
+                    !Boolean(
+                        record.rban
                     ),
+
                 rban:
-                    Boolean(row.rban),
-                username:
-                    row.roblox_username,
-                roblox_user_id:
-                    String(
-                        row.roblox_user_id
+                    Boolean(
+                        record.rban
                     ),
-                discord_user_id:
-                    row.discord_user_id,
+
                 source:
-                    row.authorization_source,
-                authorized_at:
-                    row.authorized_at
+                    record.authorization_source,
+
+                authorizedAt:
+                    record.authorized_at
             });
 
         } catch (error) {
@@ -3796,9 +5395,9 @@ app.get(
                 error
             );
 
-            return res.status(500)
+            return res
+                .status(500)
                 .json({
-                    success: false,
                     error:
                         "Internal server error"
                 });
@@ -3808,99 +5407,104 @@ app.get(
 
 
 /* =========================================================
-   BADGE AUTHORIZE API
+   POST /BADGE-AUTHORIZE
 ========================================================= */
 
 app.post(
     "/badge-authorize",
     async (req, res) => {
 
+        if (
+            !checkApiSecret(req)
+        ) {
+
+            return res
+                .status(401)
+                .json({
+                    error:
+                        "Unauthorized"
+                });
+        }
+
         try {
 
-            if (
-                !checkApiSecret(
-                    req,
-                    res
-                )
-            ) {
-                return;
-            }
-
             const {
-                roblox_username,
-                roblox_user_id,
-                discord_user_id
+                robloxUsername,
+                robloxUserId,
+                discordUserId
             } = req.body;
 
             if (
-                !roblox_username ||
-                !roblox_user_id
+                !robloxUsername ||
+                !robloxUserId
             ) {
 
-                return res.status(400)
+                return res
+                    .status(400)
                     .json({
-                        success: false,
                         error:
-                            "Missing Roblox information"
+                            "Missing Roblox user information"
                     });
             }
 
             const result =
                 await saveAuthorization({
-                    robloxUsername:
-                        String(
-                            roblox_username
-                        ),
+
+                    robloxUsername,
 
                     robloxUserId:
                         String(
-                            roblox_user_id
+                            robloxUserId
                         ),
 
                     discordUserId:
-                        discord_user_id
-                            ? String(
-                                discord_user_id
-                            )
-                            : "roblox",
+                        discordUserId ||
+                        "ROBLOX_BADGE",
 
                     source:
                         "roblox-badge",
 
                     authorizedBy:
-                        "Roblox Badge Sync"
+                        "ROBLOX_BADGE"
                 });
 
             if (
-                !result.success
+                result.reason ===
+                "rban"
             ) {
 
-                return res.status(403)
+                return res
+                    .status(403)
                     .json({
-                        success: false,
-                        authorized: false,
-                        reason:
-                            result.reason
+                        error:
+                            "User is rBanned"
                     });
             }
 
             return res.json({
-                success: true,
-                authorized: true,
-                badge_id:
-                    BADGE_ID
+                success:
+                    true,
+
+                authorized:
+                    true,
+
+                username:
+                    robloxUsername,
+
+                userId:
+                    robloxUserId
             });
 
         } catch (error) {
 
             console.error(
-                "[BADGE API ERROR]",
+                "[BADGE AUTHORIZE ERROR]",
                 error
             );
 
-            return res.status(500)
+            return res
+                .status(500)
                 .json({
-                    success: false,
                     error:
                         "Internal server error"
                 });
@@ -3910,7 +5514,7 @@ app.post(
 
 
 /* =========================================================
-   EXPRESS ERROR HANDLER
+   API ERROR HANDLER
 ========================================================= */
 
 app.use(
@@ -3921,12 +5525,7 @@ app.use(
             error
         );
 
-        if (res.headersSent) {
-            return next(error);
-        }
-
         res.status(500).json({
-            success: false,
             error:
                 "Internal server error"
         });
@@ -3935,12 +5534,11 @@ app.use(
 
 
 /* =========================================================
-   START EXPRESS
+   START WEB SERVER
 ========================================================= */
 
 app.listen(
     PORT,
-    "0.0.0.0",
     () => {
 
         console.log(
@@ -3951,75 +5549,7 @@ app.listen(
 
 
 /* =========================================================
-   DISCORD READY
-========================================================= */
-
-client.once(
-    "clientReady",
-    async () => {
-
-        console.log(
-            `[DISCORD] Logged in as ${client.user.tag}`
-        );
-
-        try {
-
-            await setupDatabase();
-
-            await client.application.commands
-                .set(commands);
-
-            console.log(
-                "[DISCORD] Slash commands registered"
-            );
-
-            for (
-                const guild
-                of client.guilds.cache.values()
-            ) {
-
-                await updateLeaderboard(
-                    guild
-                ).catch(() => {});
-            }
-
-            setInterval(
-                async () => {
-
-                    for (
-                        const guild
-                        of client.guilds.cache.values()
-                    ) {
-
-                        await updateLeaderboard(
-                            guild
-                        ).catch(
-                            error => {
-                                console.error(
-                                    "[LEADERBOARD ERROR]",
-                                    error.message
-                                );
-                            }
-                        );
-                    }
-
-                },
-                30 * 60 * 1000
-            );
-
-        } catch (error) {
-
-            console.error(
-                "[READY ERROR]",
-                error
-            );
-        }
-    }
-);
-
-
-/* =========================================================
-   LOGIN
+   START DISCORD
 ========================================================= */
 
 client.login(
@@ -4032,6 +5562,10 @@ client.login(
             error
         );
 
-        process.exit(1);
+        /*
+           Do not immediately terminate Railway.
+           This allows the logs to show the actual
+           Discord connection error.
+        */
     }
 );
