@@ -4036,7 +4036,7 @@ ephemeral: true
 // COMMAND DEFINITIONS
 // ============================================================
 
-const commands = [
+commands.push(
 
     new SlashCommandBuilder()
         .setName("auth")
@@ -4228,7 +4228,7 @@ const commands = [
                 .setName("forceclose")
                 .setDescription("Immediately close the current ticket.")
         )
-];
+);
 
 // ============================================================
 // REGISTER COMMANDS
