@@ -2109,6 +2109,13 @@ ephemeral: true
                 return; 
             } 
  
+            // Slash commands are handled by the second interaction handler below.
+            if (interaction.isChatInputCommand()) {
+                return;
+            }
+
+            return;
+
             const guild = 
                 interaction.guild; 
  
