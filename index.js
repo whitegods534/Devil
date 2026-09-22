@@ -689,11 +689,11 @@ function hsvToRgb(h, s, v) {
 }
 
 function startRainbowRole() {
-    console.log("[RAINBOW] Smooth rainbow role animation started.");
+    console.log("[RAINBOW] Fast rainbow animation started.");
 
     setInterval(async () => {
         try {
-            rainbowHue += 1.5;
+            rainbowHue += 10;
 
             if (rainbowHue >= 360) {
                 rainbowHue = 0;
@@ -713,13 +713,13 @@ function startRainbowRole() {
 
                 await role.setColor(
                     color,
-                    "Smooth rainbow role animation"
+                    "Fast rainbow role animation"
                 ).catch(() => {});
             }
         } catch (error) {
             console.error("[RAINBOW ERROR]", error.message);
         }
-    }, 1500);
+    }, 1000);
 }
 
 /* =========================================================
