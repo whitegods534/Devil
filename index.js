@@ -35,6 +35,7 @@ const MANAGER_ROLE_ID = "1550551297642729552";
 const FINANCIAL_OPERATIONS_ROLE_ID = "1551601783581843497";
 
 const LEADERBOARD_CHANNEL_ID = "1551976849385586759";
+const RAINBOW_ROLE_ID = "1551984321395429416";
 
 if (!TOKEN) {
     console.error("Missing DISCORD_TOKEN");
@@ -642,11 +643,95 @@ async function updateLeaderboard(guild) {
     }
 }
 
+
+/* =========================================================
+   RAINBOW ROLE
+========================================================= */
+
+let rainbowHue = 0;
+
+function hsvToRgb(h, s, v) {
+    h = h % 360;
+
+    const c = v * s;
+    const x = c * (1 - Math.abs((h / 60) % 2 - 1));
+    const m = v - c;
+
+    let r = 0;
+    let g = 0;
+    let b = 0;
+
+    if (h < 60) {
+        r = c;
+        g = x;
+    } else if (h < 120) {
+        r = x;
+        g = c;
+    } else if (h < 180) {
+        g = c;
+        b = x;
+    } else if (h < 240) {
+        g = x;
+        b = c;
+    } else if (h < 300) {
+        r = x;
+        b = c;
+    } else {
+        r = c;
+        b = x;
+    }
+
+    return {
+        r: Math.round((r + m) * 255),
+        g: Math.round((g + m) * 255),
+        b: Math.round((b + m) * 255)
+    };
+}
+
+function startRainbowRole() {
+    console.log("[RAINBOW] Smooth rainbow role animation started.");
+
+    setInterval(async () => {
+        try {
+            rainbowHue += 1.5;
+
+            if (rainbowHue >= 360) {
+                rainbowHue = 0;
+            }
+
+            const rgb = hsvToRgb(rainbowHue, 1, 1);
+
+            const color =
+                (rgb.r << 16) |
+                (rgb.g << 8) |
+                rgb.b;
+
+            for (const guild of client.guilds.cache.values()) {
+                const role = guild.roles.cache.get(RAINBOW_ROLE_ID);
+
+                if (!role || role.id === guild.id) continue;
+
+                await role.setColor(
+                    color,
+                    "Smooth rainbow role animation"
+                ).catch(() => {});
+            }
+        } catch (error) {
+            console.error("[RAINBOW ERROR]", error.message);
+        }
+    }, 1500);
+}
+
 /* =========================================================
    SLASH COMMANDS
 ========================================================= */
 
 const commands = [
+
+    new SlashCommandBuilder()
+        .setName("cmdshelp")
+        .setDescription("View all Devil bot commands and what they do"),
+
 
     new SlashCommandBuilder()
         .setName("auth")
@@ -857,6 +942,7 @@ const commands = [
 
 client.once("clientReady", async () => {
     console.log(`[DISCORD] Logged in as ${client.user.tag}`);
+        startRainbowRole();
 
     try {
         await setupDatabase();
@@ -899,6 +985,9 @@ client.on("interactionCreate", async interaction => {
         ================================================ */
 
         if (interaction.isButton()) {
+
+            // ticket_create is handled by the dedicated ticket creation handler below.
+            if (interaction.customId === "ticket_create") return;
 
             const guild = interaction.guild;
 
@@ -1146,6 +1235,55 @@ client.on("interactionCreate", async interaction => {
         if (!guild) {
             return interaction.reply({
                 content: "This command can only be used inside a server.",
+                ephemeral: true
+            });
+        }
+
+
+        if (interaction.commandName === "cmdshelp") {
+
+            const embed = new EmbedBuilder()
+                .setTitle("📖 Devil Bot Commands")
+                .setDescription("Here are all available commands and what they do.")
+                .addFields(
+                    {
+                        name: "🔐 Authorization",
+                        value:
+                            "`/auth <username>` — Authorize a Roblox user.\n" +
+                            "`/check <username>` — Check whether a Roblox user is authorized.\n" +
+                            "`/profile <username>` — View a Roblox user's profile information.\n" +
+                            "`/history <username>` — View authorization history for a Roblox user.",
+                        inline: false
+                    },
+                    {
+                        name: "🎫 Tickets",
+                        value:
+                            "`/ticket setup` — Configure the ticket system.\n" +
+                            "`/ticket panel` — Send the ticket creation panel.\n" +
+                            "`/ticket claim` — Claim the current ticket.\n" +
+                            "`/ticket close` — Close the current ticket.\n" +
+                            "`/ticket rename <name>` — Rename the current ticket.\n" +
+                            "`/ticket add <user>` — Add a user to the current ticket.\n" +
+                            "`/ticket remove <user>` — Remove a user from the current ticket.\n" +
+                            "`/escalate` — Escalate the current ticket to the Moderator team.",
+                        inline: false
+                    },
+                    {
+                        name: "📊 Staff",
+                        value:
+                            "`/stats` — View ticket statistics.\n" +
+                            "`/wipetickets <user>` — Wipe a user's ticket claim statistics.",
+                        inline: false
+                    }
+                )
+                .setColor(getColor("blue"))
+                .setFooter({
+                    text: "Devil Support System"
+                })
+                .setTimestamp();
+
+            return interaction.reply({
+                embeds: [embed],
                 ephemeral: true
             });
         }
