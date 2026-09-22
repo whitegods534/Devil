@@ -2045,37 +2045,20 @@ client.on(
                         components: [
                             new ActionRowBuilder()
                                 .addComponents(
+    new ButtonBuilder()
+        .setCustomId("close_reason_afk")
+        .setLabel("Client is AFK")
+        .setEmoji("😴")
+        .setStyle(ButtonStyle.Danger),
 
-                                    new ButtonBuilder()
-                                        .setCustomId(
-                                            "close_reason_afk"
-                                        )
-                                        .setLabel(
-                                            "Client is AFK"
-                                        )
-                                        .setEmoji(
-                                            "😴"
-                                        )
-                                        .setStyle(
-                                            ButtonStyle.Danger
-                                        ),
-
-                                    new ButtonBuilder()
-                                        .setCustomId(
-                                            "close_reason_handled"
-                                        )
-                                        .setLabel(
-                                            "Handled"
-                                        )
-                                        .setEmoji(
-                                            "✅"
-                                        )
-                                        .setStyle(
-                                            ButtonStyle.Success
-                                        )
-                                ],
-                        ],
-                        ephemeral: true
+    new ButtonBuilder()
+        .setCustomId("close_reason_handled")
+        .setLabel("Handled")
+        .setEmoji("✅")
+        .setStyle(ButtonStyle.Success)
+)
+],
+ephemeral: true
                     });
                 }
             }
