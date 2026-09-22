@@ -1,14 +1,19 @@
 {
   "name": "devil-bot",
   "version": "1.0.0",
-  "description": "Devil Discord Bot",
+  "description": "Devil Discord Authentication and Ticket Management Bot",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "dependencies": {
     "discord.js": "^14.25.1",
     "express": "^5.1.0",
-    "pg": "^8.16.3"
+    "pg": "^8.16.3",
+    "dotenv": "^17.2.2"
   }
 }
