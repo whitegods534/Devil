@@ -75,6 +75,7 @@ const MANAGER_ROLE_ID = "1550551297642729552";
 /* DEAD SIGNAL OPERATIONS */
 
 const FINANCIAL_OPERATIONS_ROLE_ID = "1544699781547434014";
+const DEAD_SIGNAL_OPERATIONS_ROLE_ID = "1544699781547434014";
 
 
 
@@ -151,10 +152,9 @@ const COLORS = {
 
 
 function getColor(name, fallback = "blue") {
-    if (typeof name === "number") return name;
-    if (typeof name === "string" && /^\d+$/.test(name)) return Number(name);
-    if (typeof name === "string" && COLORS[name] !== undefined) return COLORS[name];
-    return COLORS[fallback] ?? COLORS.blue;
+
+    return COLORS[name] || COLORS[fallback];
+
 }
 
 
@@ -3118,7 +3118,11 @@ ephemeral: true
                             .getChannel( 
                                 "log_channel", 
                                 true 
-                            ); 
+                            );
+
+                    const panelChannel =
+                        interaction.options
+                            .getChannel("panel_channel", true); 
  
                     const panelColor = 
                         interaction.options 
@@ -3203,7 +3207,7 @@ ephemeral: true
                             managementRole.id, 
                             category.id, 
                             logChannel.id, 
-                            interaction.channel.id, 
+                            panelChannel.id, 
                             panelColor, 
                             ticketColor, 
                             successColor, 
@@ -3258,7 +3262,7 @@ ephemeral: true
                             ); 
  
                     const message = 
-                        await interaction.channel 
+                        await panelChannel 
                             .send({ 
                                 embeds: [ 
                                     panel 
@@ -3386,8 +3390,18 @@ ephemeral: true
                                     ) 
                             ); 
  
+                    const panelChannel = guild.channels.cache.get(config.panel_channel_id)
+                        || await guild.channels.fetch(config.panel_channel_id).catch(() => null);
+
+                    if (!panelChannel || panelChannel.type !== ChannelType.GuildText) {
+                        return interaction.reply({
+                            embeds: [errorEmbed("Panel Channel Missing", "The configured panel channel no longer exists. Run `/ticket setup` again.")],
+                            ephemeral: true
+                        });
+                    }
+
                     const message = 
-                        await interaction.channel 
+                        await panelChannel 
                             .send({ 
                                 embeds: [ 
                                     panel 
@@ -3405,7 +3419,7 @@ ephemeral: true
                         WHERE guild_id = $3 
                         `, 
                         [ 
-                            interaction.channel.id, 
+                            panelChannel.id, 
                             message.id, 
                             guild.id 
                         ] 
@@ -4188,42 +4202,12 @@ commands.push(
                             ChannelType.GuildText 
                         ) 
                         .setRequired(true) 
-                ) 
-                .addStringOption(option => 
-                    option
-                        .setName("panel_color")
-                        .setDescription("Colour for the main ticket panel.")
-                        .setRequired(true)
-                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
                 )
-                .addStringOption(option => 
-                    option
-                        .setName("ticket_color")
-                        .setDescription("Colour for ticket embeds.")
-                        .setRequired(true)
-                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
-                )
-                .addStringOption(option => 
-                    option
-                        .setName("success_color")
-                        .setDescription("Colour for success messages.")
-                        .setRequired(true)
-                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
-                )
-                .addStringOption(option => 
-                    option
-                        .setName("error_color")
-                        .setDescription("Colour for error messages.")
-                        .setRequired(true)
-                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
-                )
-                .addStringOption(option => 
-                    option
-                        .setName("leaderboard_color")
-                        .setDescription("Colour for the leaderboard embed.")
-                        .setRequired(true)
-                        .addChoices(...Object.keys(COLORS).map(color => ({ name: color, value: color })))
-                )
+                .addStringOption(option => colorOption(option, "panel_color", "Panel colour", "blue"))
+                .addStringOption(option => colorOption(option, "ticket_color", "Ticket colour", "blue"))
+                .addStringOption(option => colorOption(option, "success_color", "Success colour", "green"))
+                .addStringOption(option => colorOption(option, "error_color", "Error colour", "red"))
+                .addStringOption(option => colorOption(option, "leaderboard_color", "Leaderboard colour", "purple"))
         ) 
  
         .addSubcommand(sub => 
@@ -4343,7 +4327,7 @@ client.once("clientReady", async () => {
 function ticketPanelEmbed(config) { 
  
     return new EmbedBuilder() 
-        .setColor(getColor(config?.panel_color, "blue")) 
+        .setColor(getColor(config?.panel_color || "blue")) 
         .setTitle("🎫 DeadSignal Support") 
         .setDescription( 
             "Need help? Create a support ticket below.\n\n" + 
@@ -4384,6 +4368,164 @@ function ticketPanelButton() {
 } 
  
 // ============================================================ 
+/* ============================================================
+   TICKET DATABASE HELPERS
+============================================================ */
+
+async function getCurrentTicket(channelId) {
+    const result = await query(
+        `SELECT * FROM tickets WHERE channel_id = $1 LIMIT 1`,
+        [channelId]
+    );
+    return result.rows[0] || null;
+}
+
+async function createTicket(guild, user) {
+    const config = await getTicketConfig(guild.id);
+    if (!config) throw new Error("Ticket system is not configured. Run /ticket setup first.");
+
+    const existing = await query(
+        `SELECT channel_id FROM tickets WHERE guild_id = $1 AND opener_id = $2 AND status NOT IN ('closed') LIMIT 1`,
+        [guild.id, user.id]
+    );
+    if (existing.rows.length) {
+        return { existing: true, channelId: existing.rows[0].channel_id };
+    }
+
+    const category = guild.channels.cache.get(String(config.category_id)) ||
+        await guild.channels.fetch(String(config.category_id)).catch(() => null);
+    if (!category || category.type !== ChannelType.GuildCategory) {
+        throw new Error("The configured ticket category does not exist or is not a category.");
+    }
+
+    const supportRole = guild.roles.cache.get(String(config.support_role_id)) ||
+        await guild.roles.fetch(String(config.support_role_id)).catch(() => null);
+    const managementRole = guild.roles.cache.get(String(config.management_role_id)) ||
+        await guild.roles.fetch(String(config.management_role_id)).catch(() => null);
+
+    if (!supportRole) throw new Error("The configured Support role no longer exists.");
+    if (!managementRole) throw new Error("The configured Management role no longer exists.");
+
+    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+    if (!me) throw new Error("I could not access my server member. Check that the bot is still in the server.");
+    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+        throw new Error("I need the Manage Channels permission to create tickets.");
+    }
+
+    const baseName = String(user.username || user.id)
+        .toLowerCase()
+        .replace(/[^a-z0-9-_]/g, "-")
+        .replace(/-+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 70) || "user";
+
+    let channel;
+    try {
+        channel = await guild.channels.create({
+            name: `ticket-${baseName}`.slice(0, 100),
+            type: ChannelType.GuildText,
+            parent: category.id,
+            topic: `DeadSignal ticket for ${user.tag} (${user.id})`,
+            permissionOverwrites: [
+                {
+                    id: guild.roles.everyone.id,
+                    deny: [PermissionFlagsBits.ViewChannel]
+                },
+                {
+                    id: user.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+                {
+                    id: supportRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+                {
+                    id: managementRole.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+                {
+                    id: me.id,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.ManageChannels,
+                        PermissionFlagsBits.ManageMessages,
+                        PermissionFlagsBits.EmbedLinks,
+                        PermissionFlagsBits.AttachFiles
+                    ]
+                }
+            ]
+        });
+
+        const inserted = await query(
+            `INSERT INTO tickets (channel_id, guild_id, opener_id, opener_tag, status)
+             VALUES ($1, $2, $3, $4, 'open')
+             RETURNING *`,
+            [channel.id, guild.id, user.id, user.tag]
+        );
+
+        const ticket = inserted.rows[0];
+        if (!ticket) throw new Error("The ticket channel was created but the database ticket record could not be created.");
+
+        await channel.send({
+            content: `<@${user.id}> <@&${supportRole.id}>`,
+            embeds: [ticketEmbed(config, ticket, user)],
+            components: [ticketButtons()]
+        });
+
+        await logTicket(
+            guild,
+            config,
+            "🎫 Ticket Created",
+            `${user} created ${channel}.`,
+            config.ticket_color || "blue"
+        ).catch(error => console.error("[TICKET LOG ERROR]", error));
+
+        await updateLeaderboard(guild).catch(() => {});
+
+        return { existing: false, channelId: channel.id };
+    } catch (error) {
+        console.error("[TICKET CREATE ERROR]", error);
+        if (channel) await channel.delete("Ticket creation failed").catch(() => {});
+        throw error;
+    }
+}
+
+async function refreshTicketMessage(channel) {
+    const ticket = await getCurrentTicket(channel.id);
+    if (!ticket) return;
+    const config = await getTicketConfig(ticket.guild_id);
+    if (!config) return;
+    const opener = await client.users.fetch(ticket.opener_id).catch(() => null);
+    const messages = await channel.messages.fetch({ limit: 50 }).catch(() => null);
+    if (!messages) return;
+    const botMessage = messages.find(m => m.author.id === client.user.id && m.embeds[0]?.title === "🎫 Support Ticket");
+    if (!botMessage) return;
+    await botMessage.edit({
+        embeds: [ticketEmbed(config, ticket, opener)],
+        components: [ticket.claimer_id ? ticketClaimedButtons() : ticketButtons()]
+    }).catch(() => {});
+}
+
 // GET CURRENT TICKET 
 // ============================================================ 
  
@@ -4566,13 +4708,25 @@ client.on("interactionCreate", async interaction => {
  
                 await interaction.deferReply({ 
                     ephemeral: true 
-                }); 
- 
-                const result = 
-                    await createTicket( 
-                        interaction.guild, 
-                        interaction.user 
-                    ); 
+                });
+
+                let result;
+                try {
+                    result = await createTicket(
+                        interaction.guild,
+                        interaction.user
+                    );
+                } catch (error) {
+                    console.error("[CREATE TICKET BUTTON ERROR]", error);
+                    return interaction.editReply({
+                        embeds: [
+                            errorEmbed(
+                                "Ticket Creation Failed",
+                                `\`${String(error?.message || "Unknown error").slice(0, 900)}\``
+                            )
+                        ]
+                    });
+                } 
  
                 if (result.existing) { 
  
@@ -6535,7 +6689,7 @@ client.on("interactionCreate", async interaction => {
  
                     return interaction.reply({ 
                         content: 
-                            "❌ DeadSignal Operations only.", 
+                            "❌ Financial Operations only.", 
                         ephemeral: true 
                     }); 
                 } 
@@ -6563,13 +6717,7 @@ client.on("interactionCreate", async interaction => {
                 const panelChannel = 
                     interaction.options.getChannel( 
                         "panel_channel" 
-                    );
-
-                const panelColor = interaction.options.getString("panel_color") || "blue";
-                const ticketColor = interaction.options.getString("ticket_color") || "blue";
-                const successColor = interaction.options.getString("success_color") || "green";
-                const errorColor = interaction.options.getString("error_color") || "red";
-                const leaderboardColor = interaction.options.getString("leaderboard_color") || "purple";
+                    ); 
  
                 await saveTicketConfig( 
                     interaction.guild.id, 
@@ -6589,36 +6737,23 @@ client.on("interactionCreate", async interaction => {
                         panel_channel_id: 
                             panelChannel.id, 
  
-                        panel_color: panelColor,
-                        ticket_color: ticketColor,
-                        success_color: successColor,
-                        error_color: errorColor,
-                        leaderboard_color: leaderboardColor 
+                        panel_color: 
+                            COLORS.blue, 
+ 
+                        ticket_color: 
+                            COLORS.blue, 
+ 
+                        success_color: 
+                            COLORS.green, 
+ 
+                        error_color: 
+                            COLORS.red, 
+ 
+                        leaderboard_color: 
+                            COLORS.purple 
                     } 
                 ); 
  
-                let panelMessageId = null;
-                try {
-                    if (!panelChannel || !panelChannel.isTextBased()) {
-                        throw new Error("The selected panel channel is not a text channel.");
-                    }
-
-                    const savedConfig = await getTicketConfig(interaction.guild.id);
-                    const panelMessage = await panelChannel.send({
-                        embeds: [ticketPanelEmbed(savedConfig)],
-                        components: [ticketPanelButton()]
-                    });
-                    panelMessageId = panelMessage.id;
-
-                    await db(`
-                        UPDATE ticket_config
-                        SET panel_message_id = $1
-                        WHERE guild_id = $2
-                    `, [panelMessage.id, interaction.guild.id]);
-                } catch (panelError) {
-                    console.error("[TICKET SETUP PANEL ERROR]", panelError);
-                }
-
                 return interaction.reply({ 
                     embeds: [ 
                         successEmbed( 
@@ -6627,9 +6762,7 @@ client.on("interactionCreate", async interaction => {
                             `**Management:** <@&${managementRole.id}>\n` + 
                             `**Category:** ${category}\n` + 
                             `**Logs:** ${logChannel}\n` + 
-                            `**Panel:** ${panelChannel}\n` +
-                            `**Colours:** ${panelColor}, ${ticketColor}, ${successColor}, ${errorColor}, ${leaderboardColor}\n` +
-                            (panelMessageId ? "\n✅ The panel was also sent automatically." : "\n⚠️ Configuration saved, but I could not send the panel. Check the bot's permissions in the panel channel.")
+                            `**Panel:** ${panelChannel}` 
                         ) 
                     ], 
                     ephemeral: true 
@@ -6649,7 +6782,7 @@ client.on("interactionCreate", async interaction => {
  
                     return interaction.reply({ 
                         content: 
-                            "❌ DeadSignal Operations only.", 
+                            "❌ Financial Operations only.", 
                         ephemeral: true 
                     }); 
                 } 
@@ -7455,7 +7588,7 @@ client.on("interactionCreate", async interaction => {
  
                 return interaction.reply({ 
                     content: 
-                        "❌ DeadSignal Operations only.", 
+                        "❌ Financial Operations only.", 
                     ephemeral: true 
                 }); 
             } 
