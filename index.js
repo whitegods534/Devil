@@ -689,11 +689,11 @@ function hsvToRgb(h, s, v) {
 }
 
 function startRainbowRole() {
-    console.log("[RAINBOW] Fast rainbow animation started.");
+    console.log("[RAINBOW] Smooth rainbow role animation started.");
 
     setInterval(async () => {
         try {
-            rainbowHue += 30;
+            rainbowHue += 1.5;
 
             if (rainbowHue >= 360) {
                 rainbowHue = 0;
@@ -713,13 +713,13 @@ function startRainbowRole() {
 
                 await role.setColor(
                     color,
-                    "Fast rainbow role animation"
+                    "Smooth rainbow role animation"
                 ).catch(() => {});
             }
         } catch (error) {
             console.error("[RAINBOW ERROR]", error.message);
         }
-    }, 500);
+    }, 1500);
 }
 
 /* =========================================================
@@ -1783,86 +1783,78 @@ client.on("interactionCreate", async interaction => {
            ESCALATE
         ================================================ */
 
-/* ESCALATE */
+        if (interaction.commandName === "escalate") {
 
-if (interaction.customId === "ticket_escalate") {
+            const config = await getTicketConfig(guild.id);
 
-    if (!canManageTickets(interaction.member, config)) {
-        return interaction.reply({
-            embeds: [
-                errorEmbed(
-                    "No Permission",
-                    "You need Support or Management to escalate tickets."
-                )
-            ],
-            ephemeral: true
-        });
-    }
-
-    // Move ticket into the escalated category.
-    // This automatically removes it from its current category.
-    try {
-        await interaction.channel.setParent(
-            "1549118580279214160",
-            {
-                lockPermissions: false
+            if (!canManageTickets(interaction.member, config)) {
+                return interaction.reply({
+                    embeds: [
+                        errorEmbed(
+                            "No Permission",
+                            "You need Support or Management to escalate tickets."
+                        )
+                    ],
+                    ephemeral: true
+                });
             }
-        );
-    } catch (error) {
-        console.error("[ESCALATE CATEGORY ERROR]", error);
 
-        return interaction.reply({
-            embeds: [
-                errorEmbed(
-                    "Escalation Failed",
-                    "I could not move this ticket into the escalated category. Make sure the bot has Manage Channels permission."
-                )
-            ],
-            ephemeral: true
-        });
-    }
+            const ticketResult = await query(
+                `SELECT * FROM tickets WHERE channel_id = $1`,
+                [interaction.channel.id]
+            );
 
-    // Update database
-    await query(
-        `
-        UPDATE tickets
-        SET status = 'escalated',
-            escalated_by = $1,
-            escalated_at = NOW()
-        WHERE channel_id = $2
-        `,
-        [
-            interaction.user.id,
-            interaction.channel.id
-        ]
-    );
+            const ticket = ticketResult.rows[0];
 
-    // Send escalation message
-    await interaction.reply({
-        content: `<@&${MANAGER_ROLE_ID}>`,
-        embeds: [
-            new EmbedBuilder()
-                .setTitle("⚠️ Ticket Escalated")
-                .setDescription(
-                    `${interaction.user} has escalated this ticket to the Moderator team.\n\n` +
-                    `This ticket has been moved to the escalated category.`
-                )
-                .setColor(getColor("orange"))
-                .setTimestamp()
-        ]
-    });
+            if (!ticket) {
+                return interaction.reply({
+                    embeds: [
+                        errorEmbed(
+                            "Not A Ticket",
+                            "This command must be used inside a ticket."
+                        )
+                    ],
+                    ephemeral: true
+                });
+            }
 
-    // Log escalation
-    await logTicket(
-        guild,
-        config,
-        "Ticket Escalated",
-        `${interaction.user} escalated ${interaction.channel} to <@&${MANAGER_ROLE_ID}>.`,
-        "orange"
-    );
+            await query(
+                `
+                UPDATE tickets
+                SET status = 'escalated',
+                    escalated_by = $1,
+                    escalated_at = NOW()
+                WHERE channel_id = $2
+                `,
+                [
+                    interaction.user.id,
+                    interaction.channel.id
+                ]
+            );
 
-    return;
-}
+            await interaction.reply({
+                content: `<@&${MANAGER_ROLE_ID}>`,
+                embeds: [
+                    new EmbedBuilder()
+                        .setTitle("⚠️ Ticket Escalated")
+                        .setDescription(
+                            `${interaction.user} has escalated this ticket to the Moderator team.`
+                        )
+                        .setColor(getColor("orange"))
+                        .setTimestamp()
+                ]
+            });
+
+            await logTicket(
+                guild,
+                config,
+                "Ticket Escalated",
+                `${interaction.user} escalated ${interaction.channel}.`,
+                "orange"
+            );
+
+            return;
+        }
 
         /* ================================================
            TICKET COMMAND
