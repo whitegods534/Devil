@@ -88,6 +88,7 @@ const FEEDBACK_CHANNEL_ID = "1551996605719380128";
 const pendingFeedback = new Map();
 
 const pendingClose = new Map();
+const pendingCloseChoice = new Map();
 
 
 
@@ -415,6 +416,44 @@ async function setupDatabase() {
 
     `);
 
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS id BIGSERIAL
+    `);
+
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS guild_id TEXT
+    `);
+
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS reason TEXT
+    `);
+
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS decided_by TEXT
+    `);
+
+    await query(`
+        ALTER TABLE ticket_join_requests
+        ADD COLUMN IF NOT EXISTS decided_at TIMESTAMPTZ
+    `);
+
+    await query(`
+        CREATE TABLE IF NOT EXISTS ticket_history (
+            id BIGSERIAL PRIMARY KEY,
+            channel_id TEXT NOT NULL,
+            guild_id TEXT NOT NULL,
+            user_id TEXT,
+            user_tag TEXT,
+            action TEXT NOT NULL,
+            details TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )
+    `);
+
 
 
     console.log("[DATABASE] Ready");
@@ -531,16 +570,16 @@ function isDeadSignalOperations(member) {
 
 
 
+function isClaimStaff(member) {
+    return hasRole(member, CLAIM_ROLE_ID);
+}
+
 function canManageTickets(member, config) {
-
     return (
-
-        isSupport(member) ||
-
-        isManagement(member, config)
-
+        isClaimStaff(member) ||
+        isManagement(member, config) ||
+        isSupport(member)
     );
-
 }
 
 
@@ -965,7 +1004,7 @@ function ticketClaimedButtons() {
                 .setStyle(ButtonStyle.Secondary), 
  
             new ButtonBuilder() 
-                .setCustomId("ticket_join_request") 
+                 .setCustomId("ticket_join") 
                 .setLabel("Request to Join") 
                 .setEmoji("👥") 
                 .setStyle(ButtonStyle.Primary), 
@@ -1054,6 +1093,74 @@ function closeChoiceButtons() {
         ); 
 } 
  
+/* =========================================================
+   TICKET CORE HELPERS
+========================================================= */
+
+async function addTicketHistory(channelId, guildId, userId, userTag, action, details = "") {
+    await query(`
+        INSERT INTO ticket_history (channel_id, guild_id, user_id, user_tag, action, details)
+        VALUES ($1,$2,$3,$4,$5,$6)
+    `, [channelId, guildId, userId, userTag, action, details]).catch(error => {
+        console.error("[TICKET HISTORY ERROR]", error.message);
+    });
+}
+
+async function getJoinedStaffCount(channelId) {
+    const result = await query(`
+        SELECT COUNT(*)::int AS count
+        FROM ticket_join_requests
+        WHERE channel_id = $1 AND status = 'accepted'
+    `, [channelId]);
+    return Number(result.rows[0]?.count || 0);
+}
+
+async function allowJoinedStaff(channel, userId) {
+    await channel.permissionOverwrites.edit(userId, {
+        ViewChannel: true, SendMessages: true, ReadMessageHistory: true,
+        AttachFiles: true, EmbedLinks: true
+    });
+}
+
+async function applyClaimPermissions(channel, claimerId) {
+    const ticket = await getCurrentTicket(channel.id);
+    const config = ticket ? await getTicketConfig(ticket.guild_id) : null;
+    await channel.permissionOverwrites.edit(CLAIM_ROLE_ID, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => {});
+    await channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => {});
+    if (config?.management_role_id) {
+        await channel.permissionOverwrites.edit(config.management_role_id, { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }).catch(() => {});
+    }
+    await channel.permissionOverwrites.edit(claimerId, {
+        ViewChannel: true, SendMessages: true, ReadMessageHistory: true,
+        AttachFiles: true, EmbedLinks: true, AddReactions: true
+    });
+}
+
+async function refreshTicketPanel(channel) {
+    return refreshTicketMessage(channel);
+}
+
+async function closeTicketAFK(channel, staffUser) {
+    const ticket = await getCurrentTicket(channel.id);
+    if (!ticket) throw new Error("This channel is not a ticket.");
+    await query(`UPDATE tickets SET status='closed', closed_at=NOW() WHERE channel_id=$1`, [channel.id]);
+    await query(`DELETE FROM ticket_join_requests WHERE channel_id=$1`, [channel.id]).catch(() => {});
+    await addTicketHistory(channel.id, channel.guild.id, staffUser.id, staffUser.tag, "CLOSED_AFK", "Client was marked AFK.");
+    const config = await getTicketConfig(channel.guild.id);
+    await logTicket(channel.guild, config, "Ticket Closed — AFK", `${staffUser} closed ${channel} because the client was AFK.`, "red");
+    setTimeout(() => channel.delete("Ticket closed — client AFK").catch(() => {}), 1500);
+}
+
+async function closeTicketHandled(channel, staffUser) {
+    const ticket = await getCurrentTicket(channel.id);
+    if (!ticket) throw new Error("This channel is not a ticket.");
+    await query(`UPDATE tickets SET status='closed', closed_at=NOW() WHERE channel_id=$1`, [channel.id]);
+    await addTicketHistory(channel.id, channel.guild.id, staffUser.id, staffUser.tag, "CLOSED_HANDLED", "Ticket marked handled and feedback requested.");
+    const config = await getTicketConfig(channel.guild.id);
+    await logTicket(channel.guild, config, "Ticket Closed — Handled", `${staffUser} marked ${channel} as handled and requested feedback.`, "green");
+    await requestTicketFeedback(channel.guild, channel, ticket);
+}
+
 /* ========================================================= 
    TICKET FEEDBACK 
 ========================================================= */ 
@@ -1655,10 +1762,8 @@ client.on(
                 ) { 
  
                     if ( 
-                        !canManageTickets( 
-                            interaction.member, 
-                            config 
-                        ) 
+                        !isClaimStaff(interaction.member) &&
+                        !isManagement(interaction.member, config)
                     ) { 
  
                         return interaction.reply({ 
@@ -1752,7 +1857,12 @@ client.on(
                                 ReadMessageHistory: true 
                             } 
                         ) 
-                        .catch(() => {}); 
+                        .catch(() => {});
+
+                    await interaction.channel.permissionOverwrites.edit(
+                        CLAIM_ROLE_ID,
+                        { ViewChannel: true, SendMessages: false, ReadMessageHistory: true }
+                    ).catch(() => {}); 
  
                     await interaction.channel 
                         .permissionOverwrites 
@@ -1805,7 +1915,8 @@ client.on(
  
                     await updateLeaderboard( 
                         guild 
-                    ); 
+                    );
+                    await refreshTicketMessage(interaction.channel);
  
                     return; 
                 } 
@@ -1813,18 +1924,13 @@ client.on(
                 /* REQUEST TO JOIN */ 
  
                 if ( 
-                    interaction.customId === 
-                    "ticket_join_request" 
+                    interaction.customId === "ticket_join_request" ||
+                    interaction.customId === "ticket_join"
                 ) { 
  
                     if ( 
-                        !isSupport( 
-                            interaction.member 
-                        ) && 
-                        !isManagement( 
-                            interaction.member, 
-                            config 
-                        ) 
+                        !isClaimStaff(interaction.member) &&
+                        !isManagement(interaction.member, config) 
                     ) { 
  
                         return interaction.reply({ 
@@ -2080,8 +2186,21 @@ client.on(
                             interaction.user.id, 
                             interaction.channel.id 
                         ] 
-                    ); 
- 
+                    );
+
+                    const escalationCategory = guild.channels.cache.get(ESCALATED_CATEGORY_ID) ||
+                        await guild.channels.fetch(ESCALATED_CATEGORY_ID).catch(() => null);
+                    if (!escalationCategory || escalationCategory.type !== ChannelType.GuildCategory) {
+                        return interaction.reply({ content: "❌ Escalation category was not found.", ephemeral: true });
+                    }
+
+                    await interaction.channel.setParent(escalationCategory.id, { lockPermissions: false });
+                    await interaction.channel.permissionOverwrites.edit(SUPPORT_ROLE_ID, { ViewChannel: false, SendMessages: false, ReadMessageHistory: false }).catch(() => {});
+                    await interaction.channel.permissionOverwrites.edit(CLAIM_ROLE_ID, { ViewChannel: false, SendMessages: false, ReadMessageHistory: false }).catch(() => {});
+                    await interaction.channel.permissionOverwrites.edit(MANAGER_ROLE_ID, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true }).catch(() => {});
+                    await interaction.channel.permissionOverwrites.edit(config.management_role_id, { ViewChannel: true, SendMessages: true, ReadMessageHistory: true }).catch(() => {});
+                    await interaction.channel.send({ content: `<@&${MANAGER_ROLE_ID}>`, embeds: [new EmbedBuilder().setTitle("⚠️ Ticket Escalated").setDescription(`${interaction.user} escalated this ticket. Support access has been removed.`).setColor(getColor("orange")).setTimestamp()] });
+
                     await interaction.reply({ 
                         content: 
                             `<@&${MANAGER_ROLE_ID}>`, 
@@ -4561,8 +4680,8 @@ async function createTicket(guild, user) {
             );
         }
 
-        const category = guild.channels.cache.get(String(config.category_id)) ||
-            await guild.channels.fetch(String(config.category_id)).catch(() => null);
+        const category = guild.channels.cache.get(TICKET_CATEGORY_ID) ||
+            await guild.channels.fetch(TICKET_CATEGORY_ID).catch(() => null);
 
         if (!category || category.type !== ChannelType.GuildCategory) {
             throw new Error("The configured ticket category does not exist or is not a category.");
@@ -4630,6 +4749,16 @@ async function createTicket(guild, user) {
                     ]
                 },
                 {
+                    id: CLAIM_ROLE_ID,
+                    allow: [
+                        PermissionFlagsBits.ViewChannel,
+                        PermissionFlagsBits.SendMessages,
+                        PermissionFlagsBits.ReadMessageHistory,
+                        PermissionFlagsBits.AttachFiles,
+                        PermissionFlagsBits.EmbedLinks
+                    ]
+                },
+                {
                     id: me.id,
                     allow: [
                         PermissionFlagsBits.ViewChannel,
@@ -4663,7 +4792,7 @@ async function createTicket(guild, user) {
 
         try {
             await channel.send({
-                content: `<@${user.id}> <@&${supportRole.id}>`,
+                content: `<@${user.id}> <@&${CLAIM_ROLE_ID}>`,
                 embeds: [ticketEmbed(config, ticket, user)],
                 components: [ticketButtons()]
             });
@@ -4943,12 +5072,10 @@ client.on("interactionCreate", async interaction => {
  
             if ( 
                 interaction.isButton() && 
-                interaction.customId === 
-                    "ticket_join" 
+                (interaction.customId === "ticket_join" || interaction.customId === "ticket_join_request") 
             ) { 
  
-                if (!(await isSupport(member)) && 
-                    !(await isManagement(member))) { 
+                if (!isClaimStaff(member) && !isManagement(member)) { 
  
                     return interaction.reply({ 
                         content: 
