@@ -151,9 +151,33 @@ const COLORS = {
 
 
 
+function colorOption(option, name, description, defaultColor = "blue") {
+
+    return option
+        .setName(name)
+        .setDescription(description)
+        .setRequired(true)
+        .addChoices(
+            { name: "Blue", value: "blue" },
+            { name: "Purple", value: "purple" },
+            { name: "Green", value: "green" },
+            { name: "Red", value: "red" },
+            { name: "Orange", value: "orange" },
+            { name: "Pink", value: "pink" },
+            { name: "Cyan", value: "cyan" },
+            { name: "Dark", value: "dark" }
+        );
+}
+
 function getColor(name, fallback = "blue") {
 
-    return COLORS[name] || COLORS[fallback];
+    if (typeof name === "number") return name;
+
+    if (typeof name === "string" && /^\d+$/.test(name)) {
+        return Number(name);
+    }
+
+    return COLORS[name] || COLORS[fallback] || COLORS.blue;
 
 }
 
