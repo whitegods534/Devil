@@ -1548,7 +1548,14 @@ client.once(
  
                 }, 
                 30 * 60 * 1000 
-            ); 
+            );
+
+            // Ticket V2: automatically remove database records for channels
+            // that were deleted manually in Discord.
+            await cleanupAllStaleTickets().catch(() => {});
+            setInterval(() => {
+                cleanupAllStaleTickets().catch(() => {});
+            }, 2 * 60 * 1000); 
  
             for ( 
                 const guild 
@@ -4449,47 +4456,139 @@ async function getCurrentTicket(channelId) {
     return result.rows[0] || null;
 }
 
+async function cleanupStaleTickets(guild) {
+    if (!guild) return { removed: 0 };
+
+    const result = await query(`
+        SELECT channel_id, opener_id
+        FROM tickets
+        WHERE guild_id = $1
+          AND status NOT IN ('closed', 'resolved')
+    `, [guild.id]);
+
+    let removed = 0;
+
+    for (const row of result.rows) {
+        let channel = null;
+
+        try {
+            channel = await guild.channels.fetch(String(row.channel_id));
+        } catch (_) {
+            channel = null;
+        }
+
+        if (channel) continue;
+
+        // The Discord channel is gone, so this is a stale database ticket.
+        await query(`
+            DELETE FROM ticket_join_requests
+            WHERE channel_id = $1
+        `, [row.channel_id]).catch(() => {});
+
+        await query(`
+            DELETE FROM tickets
+            WHERE channel_id = $1
+        `, [row.channel_id]).catch(() => {});
+
+        removed++;
+    }
+
+    if (removed) {
+        console.log(`[TICKETS] Cleaned ${removed} stale ticket record(s) in ${guild.name}`);
+    }
+
+    return { removed };
+}
+
+async function cleanupAllStaleTickets() {
+    for (const guild of client.guilds.cache.values()) {
+        await cleanupStaleTickets(guild).catch(error => {
+            console.error(`[TICKETS] Cleanup failed in ${guild.name}:`, error.message);
+        });
+    }
+}
+
 async function createTicket(guild, user) {
     const config = await getTicketConfig(guild.id);
-    if (!config) throw new Error("Ticket system is not configured. Run /ticket setup first.");
-
-    const existing = await query(
-        `SELECT channel_id FROM tickets WHERE guild_id = $1 AND opener_id = $2 AND status NOT IN ('closed') LIMIT 1`,
-        [guild.id, user.id]
-    );
-    if (existing.rows.length) {
-        return { existing: true, channelId: existing.rows[0].channel_id };
+    if (!config) {
+        throw new Error("Ticket system is not configured. Run /ticket setup first.");
     }
 
-    const category = guild.channels.cache.get(String(config.category_id)) ||
-        await guild.channels.fetch(String(config.category_id)).catch(() => null);
-    if (!category || category.type !== ChannelType.GuildCategory) {
-        throw new Error("The configured ticket category does not exist or is not a category.");
-    }
+    const lockClient = await pool.connect();
+    let channel = null;
 
-    const supportRole = guild.roles.cache.get(String(config.support_role_id)) ||
-        await guild.roles.fetch(String(config.support_role_id)).catch(() => null);
-    const managementRole = guild.roles.cache.get(String(config.management_role_id)) ||
-        await guild.roles.fetch(String(config.management_role_id)).catch(() => null);
-
-    if (!supportRole) throw new Error("The configured Support role no longer exists.");
-    if (!managementRole) throw new Error("The configured Management role no longer exists.");
-
-    const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
-    if (!me) throw new Error("I could not access my server member. Check that the bot is still in the server.");
-    if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
-        throw new Error("I need the Manage Channels permission to create tickets.");
-    }
-
-    const baseName = String(user.username || user.id)
-        .toLowerCase()
-        .replace(/[^a-z0-9-_]/g, "-")
-        .replace(/-+/g, "-")
-        .replace(/^-|-$/g, "")
-        .slice(0, 70) || "user";
-
-    let channel;
     try {
+        await lockClient.query("BEGIN");
+
+        // One ticket per user, even if they spam the button at the same time.
+        await lockClient.query(
+            `SELECT pg_advisory_xact_lock(hashtext($1))`,
+            [`deadsignal-ticket:${guild.id}:${user.id}`]
+        );
+
+        const existing = await lockClient.query(`
+            SELECT *
+            FROM tickets
+            WHERE guild_id = $1
+              AND opener_id = $2
+              AND status NOT IN ('closed', 'resolved')
+            ORDER BY created_at DESC
+        `, [guild.id, user.id]);
+
+        // Check every existing record. If Discord cannot find the channel,
+        // remove the stale database record automatically.
+        for (const row of existing.rows) {
+            let existingChannel = null;
+            try {
+                existingChannel = await guild.channels.fetch(String(row.channel_id));
+            } catch (_) {
+                existingChannel = null;
+            }
+
+            if (existingChannel) {
+                await lockClient.query("COMMIT");
+                return { existing: true, channelId: existingChannel.id };
+            }
+
+            await lockClient.query(
+                `DELETE FROM ticket_join_requests WHERE channel_id = $1`,
+                [row.channel_id]
+            ).catch(() => {});
+
+            await lockClient.query(
+                `DELETE FROM tickets WHERE channel_id = $1`,
+                [row.channel_id]
+            );
+        }
+
+        const category = guild.channels.cache.get(String(config.category_id)) ||
+            await guild.channels.fetch(String(config.category_id)).catch(() => null);
+
+        if (!category || category.type !== ChannelType.GuildCategory) {
+            throw new Error("The configured ticket category does not exist or is not a category.");
+        }
+
+        const supportRole = guild.roles.cache.get(String(config.support_role_id)) ||
+            await guild.roles.fetch(String(config.support_role_id)).catch(() => null);
+        const managementRole = guild.roles.cache.get(String(config.management_role_id)) ||
+            await guild.roles.fetch(String(config.management_role_id)).catch(() => null);
+
+        if (!supportRole) throw new Error("The configured Support role no longer exists.");
+        if (!managementRole) throw new Error("The configured Management role no longer exists.");
+
+        const me = guild.members.me || await guild.members.fetchMe().catch(() => null);
+        if (!me) throw new Error("I could not access my server member.");
+        if (!me.permissions.has(PermissionFlagsBits.ManageChannels)) {
+            throw new Error("I need the Manage Channels permission to create tickets.");
+        }
+
+        const baseName = String(user.username || user.id)
+            .toLowerCase()
+            .replace(/[^a-z0-9-_]/g, "-")
+            .replace(/-+/g, "-")
+            .replace(/^-|-$/g, "")
+            .slice(0, 70) || "user";
+
         channel = await guild.channels.create({
             name: `ticket-${baseName}`.slice(0, 100),
             type: ChannelType.GuildText,
@@ -4545,37 +4644,56 @@ async function createTicket(guild, user) {
             ]
         });
 
-        const inserted = await query(
-            `INSERT INTO tickets (channel_id, guild_id, opener_id, opener_tag, status)
-             VALUES ($1, $2, $3, $4, 'open')
-             RETURNING *`,
-            [channel.id, guild.id, user.id, user.tag]
-        );
+        const inserted = await lockClient.query(`
+            INSERT INTO tickets (
+                channel_id,
+                guild_id,
+                opener_id,
+                opener_tag,
+                status
+            )
+            VALUES ($1, $2, $3, $4, 'open')
+            RETURNING *
+        `, [channel.id, guild.id, user.id, user.tag]);
 
         const ticket = inserted.rows[0];
-        if (!ticket) throw new Error("The ticket channel was created but the database ticket record could not be created.");
+        if (!ticket) throw new Error("The ticket channel was created but the database record could not be created.");
 
-        await channel.send({
-            content: `<@${user.id}> <@&${supportRole.id}>`,
-            embeds: [ticketEmbed(config, ticket, user)],
-            components: [ticketButtons()]
-        });
+        await lockClient.query("COMMIT");
 
-        await logTicket(
-            guild,
-            config,
-            "🎫 Ticket Created",
-            `${user} created ${channel}.`,
-            config.ticket_color || "blue"
-        ).catch(error => console.error("[TICKET LOG ERROR]", error));
+        try {
+            await channel.send({
+                content: `<@${user.id}> <@&${supportRole.id}>`,
+                embeds: [ticketEmbed(config, ticket, user)],
+                components: [ticketButtons()]
+            });
 
-        await updateLeaderboard(guild).catch(() => {});
+            await logTicket(
+                guild,
+                config,
+                "🎫 Ticket Created",
+                `${user} created ${channel}.`,
+                config.ticket_color || "blue"
+            ).catch(error => console.error("[TICKET LOG ERROR]", error));
+
+            await updateLeaderboard(guild).catch(() => {});
+        } catch (sendError) {
+            // Keep the DB consistent if Discord refuses the first ticket message.
+            await query(`DELETE FROM tickets WHERE channel_id = $1`, [channel.id]).catch(() => {});
+            await channel.delete("Ticket setup message failed").catch(() => {});
+            throw sendError;
+        }
 
         return { existing: false, channelId: channel.id };
     } catch (error) {
+        await lockClient.query("ROLLBACK").catch(() => {});
+        if (channel) {
+            await channel.delete("Ticket creation failed").catch(() => {});
+        }
         console.error("[TICKET CREATE ERROR]", error);
-        if (channel) await channel.delete("Ticket creation failed").catch(() => {});
         throw error;
+    } finally {
+        lockClient.release();
     }
 }
 
