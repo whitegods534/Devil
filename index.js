@@ -74,7 +74,7 @@ const MANAGER_ROLE_ID = "1550551297642729552";
 
 /* DEAD SIGNAL OPERATIONS */
 
-const FINANCIAL_OPERATIONS_ROLE_ID = "1544699781547434014";
+const FINANCIAL_OPERATIONS_ROLE_ID = "1551601783581843497";
 const DEAD_SIGNAL_OPERATIONS_ROLE_ID = "1544699781547434014";
 
 
@@ -523,6 +523,10 @@ function isFinancialOperations(member) {
 
     );
 
+}
+
+function isDeadSignalOperations(member) {
+    return hasRole(member, DEAD_SIGNAL_OPERATIONS_ROLE_ID);
 }
 
 
@@ -1003,6 +1007,34 @@ function joinRequestButtons(userId) {
         ); 
 } 
  
+function closePanelEmbed() {
+    return new EmbedBuilder()
+        .setColor(COLORS.red)
+        .setTitle('🔒 Close Ticket')
+        .setDescription('Choose how you want to close this ticket.')
+        .setTimestamp();
+}
+
+function closePanelButtons() {
+    return new ActionRowBuilder().addComponents(
+        new ButtonBuilder()
+            .setCustomId('close_reason_afk')
+            .setLabel('Client is AFK')
+            .setEmoji('😴')
+            .setStyle(ButtonStyle.Danger),
+        new ButtonBuilder()
+            .setCustomId('close_reason_handled')
+            .setLabel('Handled')
+            .setEmoji('✅')
+            .setStyle(ButtonStyle.Success),
+        new ButtonBuilder()
+            .setCustomId('close_cancel')
+            .setLabel('Cancel')
+            .setEmoji('↩️')
+            .setStyle(ButtonStyle.Secondary)
+    );
+}
+
 function closeChoiceButtons() { 
  
     return new ActionRowBuilder() 
@@ -1665,19 +1697,32 @@ client.on(
                         }); 
                     } 
  
-                    await query( 
-                        ` 
-                        UPDATE tickets 
-                        SET claimer_id = $1, 
-                            claimed_at = NOW(), 
-                            status = 'claimed' 
-                        WHERE channel_id = $2 
-                        `, 
-                        [ 
-                            interaction.user.id, 
-                            interaction.channel.id 
-                        ] 
-                    ); 
+                    const claimResult = await query(
+                        `
+                        UPDATE tickets
+                        SET claimer_id = $1,
+                            claimed_at = NOW(),
+                            status = 'claimed'
+                        WHERE channel_id = $2
+                          AND status <> 'closed'
+                          AND claimer_id IS NULL
+                        RETURNING channel_id
+                        `,
+                        [interaction.user.id, interaction.channel.id]
+                    );
+
+                    if (!claimResult.rows.length) {
+                        const current = await getCurrentTicket(interaction.channel.id);
+                        return interaction.reply({
+                            embeds: [errorEmbed(
+                                'Already Claimed',
+                                current?.claimer_id
+                                    ? `This ticket is already claimed by <@${current.claimer_id}>. Use **Request to Join** if you need access.`
+                                    : 'This ticket could not be claimed. Please try again.'
+                            )],
+                            ephemeral: true
+                        });
+                    } 
  
                     await addClaim( 
                         guild.id, 
@@ -6338,7 +6383,14 @@ client.on("interactionCreate", async interaction => {
         const member = 
             await interaction.guild.members.fetch( 
                 interaction.user.id 
-            ).catch(() => null); 
+            ).catch(() => null);
+
+        if (interaction.commandName === "cmdshelp") {
+            return interaction.reply({
+                embeds: [new EmbedBuilder().setColor(COLORS.blue).setTitle("📚 DeadSignal Bot Commands").setDescription("**Authorization**\n`/auth <robloxuser>` • `/check <robloxuser>` • `/profile <robloxuser>` • `/history <robloxuser>`\n\n**Tickets**\n`/ticket setup` • `/ticket panel` • `/ticket claim` • `/ticket unclaim` • `/ticket transfer` • `/ticket rename` • `/ticket add` • `/ticket remove` • `/ticket close` • `/ticket forceclose`\n\n**Other**\n`/escalate` • `/stats` • `/wipetickets`\n\n**Claim rule:** one staff member can claim a ticket. Other staff use **Request to Join** and wait for approval.").setFooter({text:"DeadSignal"}).setTimestamp()],
+                ephemeral: true
+            });
+        } 
  
         // ==================================================== 
         // AUTH 
@@ -6904,27 +6956,28 @@ client.on("interactionCreate", async interaction => {
                     }); 
                 } 
  
-                if (ticket.claimer_id) { 
- 
-                    return interaction.reply({ 
-                        content: 
-                            `❌ This ticket is already claimed by <@${ticket.claimer_id}>.`, 
-                        ephemeral: true 
-                    }); 
-                } 
- 
-                await db(` 
-                    UPDATE tickets 
-                    SET 
-                        claimer_id = $1, 
-                        status = 'claimed', 
-                        claimed_at = NOW() 
-                    WHERE channel_id = $2 
-                `, [ 
-                    interaction.user.id, 
-                    interaction.channel.id 
-                ]); 
- 
+                if (ticket.claimer_id) {
+                    return interaction.reply({
+                        content: `❌ This ticket is already claimed by <@${ticket.claimer_id}>. Use **Request to Join** instead.`,
+                        ephemeral: true
+                    });
+                }
+
+                const claimResult = await db(`
+                    UPDATE tickets
+                    SET claimer_id = $1, status = 'claimed', claimed_at = NOW()
+                    WHERE channel_id = $2 AND status <> 'closed' AND claimer_id IS NULL
+                    RETURNING channel_id
+                `, [interaction.user.id, interaction.channel.id]);
+
+                if (!claimResult.rows.length) {
+                    const latest = await requireTicket(interaction);
+                    return interaction.reply({
+                        content: latest?.claimer_id ? `❌ This ticket was just claimed by <@${latest.claimer_id}>. Use **Request to Join** instead.` : '❌ This ticket could not be claimed. Try again.',
+                        ephemeral: true
+                    });
+                }
+
                 await applyClaimPermissions( 
                     interaction.channel, 
                     interaction.user.id 
@@ -7651,22 +7704,17 @@ client.on("interactionCreate", async interaction => {
             error 
         ); 
  
-        if (interaction.replied || 
-            interaction.deferred) { 
- 
-            await interaction.editReply({ 
-                content: 
-                    "❌ An unexpected error occurred." 
-            }).catch(() => {}); 
- 
-        } else { 
- 
-            await interaction.reply({ 
-                content: 
-                    "❌ An unexpected error occurred.", 
-                ephemeral: true 
-            }).catch(() => {}); 
-        } 
+        const safeError = String(error?.message || "Unknown error").slice(0, 900);
+        if (interaction.replied || interaction.deferred) {
+            await interaction.editReply({
+                content: `❌ Something went wrong: \`${safeError}\``
+            }).catch(() => {});
+        } else if (interaction.isRepliable()) {
+            await interaction.reply({
+                content: `❌ Something went wrong: \`${safeError}\``,
+                ephemeral: true
+            }).catch(() => {});
+        }
     } 
 }); 
  
